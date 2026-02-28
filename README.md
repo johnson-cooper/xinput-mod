@@ -18,3 +18,9 @@ xinput mod - 1.4.7 minecraft forge mod using the jxinput library for controller 
 | D-Pad   | Third-person / HUD / Hotbar | Scroll / Hotbar                |
 | LStick  | Move player              | Move cursor                       |
 | RStick  | Camera / optional GUI    | Move cursor (if implemented)      |
+
+
+# License
+
+MIT License
+ – Free to use and modify.
