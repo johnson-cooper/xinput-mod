@@ -1,12 +1,5 @@
 package com.attackishere.xinput;
 
-import com.github.strikerx3.jxinput.XInputDevice;
-import com.github.strikerx3.jxinput.XInputComponents;
-import com.github.strikerx3.jxinput.XInputAxes;
-import com.github.strikerx3.jxinput.XInputButtons;
-import com.github.strikerx3.jxinput.exceptions.XInputNotLoadedException;
-import com.github.strikerx3.jxinput.natives.XInputConstants;
-
 import cpw.mods.fml.common.ITickHandler;
 import cpw.mods.fml.common.TickType;
 
@@ -27,28 +20,41 @@ import java.util.List;
 
 public class XInputTickHandler implements ITickHandler {
 
-    private XInputDevice controller = null;
     private final Minecraft mc = Minecraft.getMinecraft();
     private final XInputSharedState state;
 
-    //   Tuning    
+    //  Controller backends 
+    // JInput is tried first — it ships bundled with Minecraft's LWJGL, so
+    // no extra dependencies are needed and it works on Windows/macOS/Linux.
+    // JXInput is used as a fallback on Windows if JInput's environment is
+    // broken (e.g. RawInput NPE on certain HID devices like ITE Device).
+    private final JInputController jinput = new JInputController();
+    private boolean jinputPermanentlyFailed = false;
+    private Object jxController = null;   // XInputDevice, held as Object to avoid hard dep
+    private boolean jxInitAttempted = false;
+    private boolean usingJXInput = false;
+
+    // Normalised state filled each tick by whichever backend is active
+    private final ControllerState cs = new ControllerState();
+
+    //  Tuning 
     private static final float MOVE_DEADZONE       = 0.25f;
     private static final float GUI_CURSOR_DEADZONE = 0.15f;
-    private static final float GUI_CURSOR_SPEED    = 12.0f; // scaled-gui-pixels per tick
+    private static final float GUI_CURSOR_SPEED    = 12.0f;
     private static final int   DEBUG_PRINT_EVERY   = 0;
 
-    //   Previous button states     ─
+    //  Previous button states 
     private boolean prevA, prevB, prevX, prevY;
     private boolean prevBack, prevStart, prevLB, prevRB;
     private boolean prevLThumb, prevRThumb;
     private boolean prevDpadUp, prevDpadDown, prevDpadLeft, prevDpadRight;
 
-    //   Drag state           ─
-    private boolean isDragging   = false;
-    private long    aHeldSince   = 0;
+    //  Drag state 
+    private boolean isDragging = false;
+    private long    aHeldSince = 0;
     private static final long DRAG_THRESHOLD_MS = 200;
 
-    //   Misc     
+    //  Misc 
     private int dropFrameCounter = 0;
     private int debugCounter     = 0;
 
@@ -59,68 +65,6 @@ public class XInputTickHandler implements ITickHandler {
     private void log(String s) { System.out.println("[XInputMod] " + s); }
 
     // =========================================================================
-    // Controller init
-    // =========================================================================
-    private void initController() {
-        controller = null;
-        if (!XInputDevice.isAvailable()) { log("JXInput not available."); return; }
-        try {
-            XInputDevice[] devices = XInputDevice.getAllDevices();
-            if (devices != null)
-                for (XInputDevice dev : devices)
-                    if (dev != null && dev.isConnected()) { controller = dev; break; }
-            if (controller == null)
-                for (int i = 0; i < XInputConstants.MAX_PLAYERS; i++) {
-                    try {
-                        XInputDevice dev = XInputDevice.getDeviceFor(i);
-                        if (dev != null && dev.isConnected()) { controller = dev; break; }
-                    } catch (Throwable ignored) {}
-                }
-        } catch (XInputNotLoadedException e) {
-            log("Native library failed: " + e.getMessage());
-        } catch (Throwable t) {
-            log("initController error: " + t);
-        }
-        if (controller != null) {
-            log("Controller connected: player " + controller.getPlayerNum());
-            XInputDevice.setPreProcessData(true);
-        } else {
-            log("No Xbox controller detected.");
-        }
-    }
-
-    // =========================================================================
-    // Reflection helpers
-    // =========================================================================
-    private boolean btn(XInputButtons buttons, String name) {
-        try { Field f = buttons.getClass().getField(name); f.setAccessible(true); return f.getBoolean(buttons); }
-        catch (Throwable t) {
-            try { Field f = buttons.getClass().getDeclaredField(name); f.setAccessible(true); return f.getBoolean(buttons); }
-            catch (Throwable ignored) { return false; }
-        }
-    }
-
-    private float axis(XInputAxes axes, String name) {
-        try { Field f = axes.getClass().getField(name); f.setAccessible(true); return f.getFloat(axes); }
-        catch (Throwable t) {
-            try { Field f = axes.getClass().getDeclaredField(name); f.setAccessible(true); return f.getFloat(axes); }
-            catch (Throwable ignored) { return 0f; }
-        }
-    }
-
-    private static float processAxis(float v, float dz) {
-        float abs = Math.abs(v);
-        if (abs <= dz) return 0f;
-        float sign = v < 0 ? -1f : 1f;
-        float norm = (abs - dz) / (1f - dz);
-        return sign * norm * norm;
-    }
-
-    private static float clamp(float v, float min, float max) {
-        return v < min ? min : (v > max ? max : v);
-    }
-
-    // =========================================================================
     // ITickHandler
     // =========================================================================
     @Override public EnumSet<TickType> ticks()  { return EnumSet.of(TickType.CLIENT); }
@@ -129,95 +73,233 @@ public class XInputTickHandler implements ITickHandler {
 
     @Override
     public void tickStart(EnumSet<TickType> types, Object... tickData) {
-        if (controller == null) initController();
-        if (controller == null) { state.rawRx = 0f; state.rawRy = 0f; return; }
+        boolean ok = pollController();
+        if (!ok) {
+            state.rawRx = 0f;
+            state.rawRy = 0f;
+            releaseMovementKeys();
+            return;
+        }
 
-        boolean ok;
-        try { ok = controller.poll(); } catch (Throwable t) { ok = false; }
-        if (!ok) { controller = null; state.rawRx = 0f; state.rawRy = 0f; return; }
-
-        XInputComponents components;
-        try { components = controller.getComponents(); } catch (Throwable t) { return; }
-        if (components == null) return;
-
-        XInputAxes    axes    = components.getAxes();
-        XInputButtons buttons = components.getButtons();
-        if (axes == null || buttons == null) return;
-
-        state.rawRx = axes.rx;
-        state.rawRy = axes.ry;
-
-        boolean curA      = btn(buttons, "a");
-        boolean curB      = btn(buttons, "b");
-        boolean curX      = btn(buttons, "x");
-        boolean curY      = btn(buttons, "y");
-        boolean curLB     = btn(buttons, "lShoulder");
-        boolean curRB     = btn(buttons, "rShoulder");
-        boolean curBack   = btn(buttons, "back");
-        boolean curStart  = btn(buttons, "start");
-        boolean curLThumb = btn(buttons, "lThumb");
-        boolean curRThumb = btn(buttons, "rThumb");
-        boolean curDpadUp    = btn(buttons, "up")    || btn(buttons, "dpadUp");
-        boolean curDpadDown  = btn(buttons, "down")  || btn(buttons, "dpadDown");
-        boolean curDpadLeft  = btn(buttons, "left")  || btn(buttons, "dpadLeft");
-        boolean curDpadRight = btn(buttons, "right") || btn(buttons, "dpadRight");
-
-        float ltVal = axis(axes, "lt"); if (ltVal == 0f) ltVal = axis(axes, "lz");
-        float rtVal = axis(axes, "rt"); if (rtVal == 0f) rtVal = axis(axes, "rz");
-        boolean ltPressed = ltVal > 0.45f;
-        boolean rtPressed = rtVal > 0.45f;
+        state.rawRx = cs.rx;
+        state.rawRy = cs.ry;
 
         boolean inGui = mc.currentScreen != null;
 
         if (inGui) {
-            handleGui(axes, curA, curB, curX, curY,
-                curLB, curRB, curStart, curBack, curLThumb, curRThumb,
-                curDpadUp, curDpadDown, curDpadLeft, curDpadRight,
-                ltPressed, rtPressed);
+            handleGui();
             releaseMovementKeys();
             dropFrameCounter = 0;
         } else {
             state.cursorInitialised  = false;
             state.stickMovedThisTick = false;
             isDragging = false;
-            handleGameplay(axes, curA, curB, curX, curY,
-                curLB, curRB, curStart, curBack, curLThumb, curRThumb,
-                curDpadUp, curDpadDown, curDpadLeft, curDpadRight,
-                ltPressed, rtPressed);
+            handleGameplay();
         }
 
         if (DEBUG_PRINT_EVERY > 0 && ++debugCounter >= DEBUG_PRINT_EVERY) {
             debugCounter = 0;
             log(String.format("L=(%.2f,%.2f) R=(%.2f,%.2f) LT=%.2f RT=%.2f",
-                axes.lx, axes.ly, axes.rx, axes.ry, ltVal, rtVal));
+                cs.lx, cs.ly, cs.rx, cs.ry, cs.lt, cs.rt));
         }
 
-        prevA = curA; prevB = curB; prevX = curX; prevY = curY;
-        prevLB = curLB; prevRB = curRB;
-        prevBack = curBack; prevStart = curStart;
-        prevLThumb = curLThumb; prevRThumb = curRThumb;
-        prevDpadUp = curDpadUp; prevDpadDown = curDpadDown;
-        prevDpadLeft = curDpadLeft; prevDpadRight = curDpadRight;
+        prevA = cs.a; prevB = cs.b; prevX = cs.x; prevY = cs.y;
+        prevLB = cs.lb; prevRB = cs.rb;
+        prevBack = cs.back; prevStart = cs.start;
+        prevLThumb = cs.lThumb; prevRThumb = cs.rThumb;
+        prevDpadUp = cs.dpadUp; prevDpadDown = cs.dpadDown;
+        prevDpadLeft = cs.dpadLeft; prevDpadRight = cs.dpadRight;
+    }
+
+    // =========================================================================
+    // Controller polling — SDL2 primary, JXInput fallback (Windows only)
+    // =========================================================================
+
+    /**
+     * Fills cs with the current controller state.
+     * Returns false if no controller is available.
+     *
+     * Priority:
+     *   1. JInput (bundled with Minecraft's LWJGL — works on Windows/macOS/Linux)
+     *   2. JXInput (Windows only fallback, used when JInput's environment is
+     *      broken by a bad HID device like ITE Device causing a RawInput NPE)
+     */
+    private boolean pollController() {
+        //  Try JInput first 
+        if (!usingJXInput && !jinputPermanentlyFailed) {
+            JInputController.InitResult result = jinput.init();
+            if (result == JInputController.InitResult.OK) {
+                boolean ok = jinput.poll(cs);
+                if (ok) return true;
+                // poll returned false = disconnected, will re-init next tick
+            } else if (result == JInputController.InitResult.ENVIRONMENT_BROKEN) {
+                // JInput's environment failed. On Windows this used to mean the
+                // RawInput NPE was unrecoverable, but now JInputController tries
+                // DirectInputEnvironmentPlugin directly which avoids the NPE.
+                // If even that failed, permanently fall back to JXInput.
+                jinputPermanentlyFailed = true;
+                log("JInput environment broken, falling back to JXInput.");
+            }
+            // InitResult.NO_CONTROLLER = environment ok but no gamepad found yet,
+            // keep retrying JInput in case controller is plugged in later.
+        }
+
+        //  JInput unavailable — try JXInput (Windows only) 
+        if (!usingJXInput && !jxInitAttempted) {
+            jxInitAttempted = true;
+            jxController = initJXInput();
+            if (jxController != null) {
+                usingJXInput = true;
+                log("Using JXInput backend.");
+            } else {
+                log("No controller backend available.");
+            }
+        }
+
+        if (usingJXInput && jxController != null) {
+            return pollJXInput();
+        }
+
+        // If JXInput also failed, keep retrying it periodically in case
+        // the controller gets plugged in later.
+        if (usingJXInput && jxController == null) {
+            jxInitAttempted = false;
+        }
+
+        cs.zero();
+        return false;
+    }
+
+    //  JXInput via reflection 
+    // All JXInput access goes through reflection so the mod compiles and loads
+    // on macOS/Linux where the JXInput classes aren't present at all.
+
+    private Object initJXInput() {
+        try {
+            Class<?> devCls = Class.forName("com.github.strikerx3.jxinput.XInputDevice");
+            Method isAvail = devCls.getMethod("isAvailable");
+            if (!(Boolean) isAvail.invoke(null)) return null;
+
+            // Try getAllDevices first
+            try {
+                Method getAll = devCls.getMethod("getAllDevices");
+                Object[] devices = (Object[]) getAll.invoke(null);
+                if (devices != null) {
+                    for (Object dev : devices) {
+                        Method isConn = devCls.getMethod("isConnected");
+                        if (dev != null && (Boolean) isConn.invoke(dev)) {
+                            Method preProcess = devCls.getMethod("setPreProcessData", boolean.class);
+                            preProcess.invoke(null, true);
+                            log("JXInput controller connected.");
+                            return dev;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            // Fall back to getDeviceFor(0..3)
+            Method getFor = devCls.getMethod("getDeviceFor", int.class);
+            for (int i = 0; i < 4; i++) {
+                try {
+                    Object dev = getFor.invoke(null, i);
+                    Method isConn = devCls.getMethod("isConnected");
+                    if (dev != null && (Boolean) isConn.invoke(dev)) {
+                        try {
+                            Method preProcess = devCls.getMethod("setPreProcessData", boolean.class);
+                            preProcess.invoke(null, true);
+                        } catch (Throwable ignored) {}
+                        log("JXInput controller connected at index " + i);
+                        return dev;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (ClassNotFoundException ignored) {
+            // JXInput not on classpath — expected on macOS/Linux
+        } catch (Throwable t) {
+            log("JXInput init error: " + t);
+        }
+        return null;
+    }
+
+    private boolean pollJXInput() {
+        try {
+            Class<?> devCls  = jxController.getClass();
+            Method pollM     = devCls.getMethod("poll");
+            boolean ok       = (Boolean) pollM.invoke(jxController);
+            if (!ok) { jxController = null; usingJXInput = false; jxInitAttempted = false; cs.zero(); return false; }
+
+            Method getComp   = devCls.getMethod("getComponents");
+            Object comps     = getComp.invoke(jxController);
+            if (comps == null) return false;
+
+            Object axes    = comps.getClass().getMethod("getAxes").invoke(comps);
+            Object buttons = comps.getClass().getMethod("getButtons").invoke(comps);
+            if (axes == null || buttons == null) return false;
+
+            cs.lx = jxAxis(axes, "lx");
+            cs.ly = jxAxis(axes, "ly");
+            cs.rx = jxAxis(axes, "rx");
+            cs.ry = jxAxis(axes, "ry");
+            cs.lt = jxAxis(axes, "lt"); if (cs.lt == 0f) cs.lt = jxAxis(axes, "lz");
+            cs.rt = jxAxis(axes, "rt"); if (cs.rt == 0f) cs.rt = jxAxis(axes, "rz");
+
+            cs.a      = jxBtn(buttons, "a");
+            cs.b      = jxBtn(buttons, "b");
+            cs.x      = jxBtn(buttons, "x");
+            cs.y      = jxBtn(buttons, "y");
+            cs.lb     = jxBtn(buttons, "lShoulder");
+            cs.rb     = jxBtn(buttons, "rShoulder");
+            cs.lThumb = jxBtn(buttons, "lThumb");
+            cs.rThumb = jxBtn(buttons, "rThumb");
+            cs.start  = jxBtn(buttons, "start");
+            cs.back   = jxBtn(buttons, "back");
+            cs.dpadUp    = jxBtn(buttons, "up")    || jxBtn(buttons, "dpadUp");
+            cs.dpadDown  = jxBtn(buttons, "down")  || jxBtn(buttons, "dpadDown");
+            cs.dpadLeft  = jxBtn(buttons, "left")  || jxBtn(buttons, "dpadLeft");
+            cs.dpadRight = jxBtn(buttons, "right") || jxBtn(buttons, "dpadRight");
+            return true;
+        } catch (Throwable t) {
+            log("JXInput poll error: " + t);
+            jxController = null; usingJXInput = false; jxInitAttempted = false;
+            cs.zero();
+            return false;
+        }
+    }
+
+    private boolean jxBtn(Object buttons, String name) {
+        try {
+            Field f;
+            try { f = buttons.getClass().getField(name); }
+            catch (Throwable ignored) { f = buttons.getClass().getDeclaredField(name); }
+            f.setAccessible(true);
+            return f.getBoolean(buttons);
+        } catch (Throwable ignored) { return false; }
+    }
+
+    private float jxAxis(Object axes, String name) {
+        try {
+            Field f;
+            try { f = axes.getClass().getField(name); }
+            catch (Throwable ignored) { f = axes.getClass().getDeclaredField(name); }
+            f.setAccessible(true);
+            return f.getFloat(axes);
+        } catch (Throwable ignored) { return 0f; }
     }
 
     // =========================================================================
     // Gameplay
     // =========================================================================
-    private void handleGameplay(
-        XInputAxes axes,
-        boolean curA, boolean curB, boolean curX, boolean curY,
-        boolean curLB, boolean curRB, boolean curStart, boolean curBack,
-        boolean curLThumb, boolean curRThumb,
-        boolean curDpadUp, boolean curDpadDown, boolean curDpadLeft, boolean curDpadRight,
-        boolean ltPressed, boolean rtPressed
-    ) {
-        float procLx = processAxis(axes.lx, MOVE_DEADZONE);
-        float procLy = processAxis(axes.ly, MOVE_DEADZONE);
+    private void handleGameplay() {
+        float procLx = processAxis(cs.lx, MOVE_DEADZONE);
+        float procLy = processAxis(cs.ly, MOVE_DEADZONE);
 
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, procLy >  0.001f);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode,    procLy < -0.001f);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindLeft.keyCode,    procLx < -0.001f);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.keyCode,   procLx >  0.001f);
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode,  procLy >  0.001f);
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode,     procLy < -0.001f);
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindLeft.keyCode,     procLx < -0.001f);
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.keyCode,    procLx >  0.001f);
+
+        boolean ltPressed = cs.lt > 0.45f;
+        boolean rtPressed = cs.rt > 0.45f;
 
         KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, ltPressed);
         KeyBinding.setKeyBindState(mc.gameSettings.keyBindAttack.keyCode,  rtPressed);
@@ -227,28 +309,29 @@ public class XInputTickHandler implements ITickHandler {
                 mc.playerController.attackEntity(mc.thePlayer, mc.objectMouseOver.entityHit);
         }
 
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, curA);
-        if (curB && !prevB) dropFrameCounter = 2;
-        if (curX && !prevX && mc.thePlayer != null)
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, cs.a);
+        if (cs.b && !prevB) dropFrameCounter = 2;
+        if (cs.x && !prevX && mc.thePlayer != null)
             mc.displayGuiScreen(new GuiInventory(mc.thePlayer));
 
-        if (curLB && !prevLB && mc.thePlayer != null)
+        if (cs.lb && !prevLB && mc.thePlayer != null)
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 8) % 9;
-        if (curRB && !prevRB && mc.thePlayer != null)
+        if (cs.rb && !prevRB && mc.thePlayer != null)
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 1) % 9;
 
-        if (curLThumb && !prevLThumb && mc.thePlayer != null)
+        if (cs.lThumb && !prevLThumb && mc.thePlayer != null)
             mc.thePlayer.setSprinting(!mc.thePlayer.isSprinting());
-        if (curRThumb && !prevRThumb && mc.thePlayer != null)
-            mc.thePlayer.setSneaking(!mc.thePlayer.isSneaking());
+        // Hold sneak keybind while rThumb is held — setSneaking() alone doesn't
+        // sync crouch state to the server correctly in 1.4.7.
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSneak.keyCode, cs.rThumb);
 
-        if (curDpadUp   && !prevDpadUp)
+        if (cs.dpadUp   && !prevDpadUp)
             mc.gameSettings.thirdPersonView = (mc.gameSettings.thirdPersonView + 1) % 3;
-        if (curDpadDown && !prevDpadDown)
+        if (cs.dpadDown && !prevDpadDown)
             mc.gameSettings.hideGUI = !mc.gameSettings.hideGUI;
 
-        if (curStart && !prevStart) openPauseMenu();
-        if (curBack  && !prevBack && mc.thePlayer != null)
+        if (cs.start && !prevStart) openPauseMenu();
+        if (cs.back  && !prevBack && mc.thePlayer != null)
             mc.displayGuiScreen(new GuiChat());
 
         if (dropFrameCounter > 0) {
@@ -262,84 +345,66 @@ public class XInputTickHandler implements ITickHandler {
     // =========================================================================
     // GUI
     // =========================================================================
-    private void handleGui(
-        XInputAxes axes,
-        boolean curA, boolean curB, boolean curX, boolean curY,
-        boolean curLB, boolean curRB, boolean curStart, boolean curBack,
-        boolean curLThumb, boolean curRThumb,
-        boolean curDpadUp, boolean curDpadDown, boolean curDpadLeft, boolean curDpadRight,
-        boolean ltPressed, boolean rtPressed
-    ) {
+    private void handleGui() {
         GuiScreen screen = mc.currentScreen;
 
-        // Get scaled resolution — all GUI coords are in scaled space
         ScaledResolution sr = getScaledResolution();
         int scaledW = sr.getScaledWidth();
         int scaledH = sr.getScaledHeight();
 
-        // Initialise cursor to screen centre in scaled coords
         if (!state.cursorInitialised) {
-            state.cursorGuiX      = scaledW / 2f;
-            state.cursorGuiY      = scaledH / 2f;
+            state.cursorGuiX       = scaledW / 2f;
+            state.cursorGuiY       = scaledH / 2f;
             state.cursorInitialised = true;
         }
 
-        // Move cursor with LEFT stick — work entirely in scaled GUI coords
-        // Y is negated because stick-up (positive ry) should move cursor up (decreasing Y)
-        float rsX = processAxis(axes.lx, GUI_CURSOR_DEADZONE);
-        float rsY = processAxis(axes.ly, GUI_CURSOR_DEADZONE);
+        float rsX = processAxis(cs.lx, GUI_CURSOR_DEADZONE);
+        float rsY = processAxis(cs.ly, GUI_CURSOR_DEADZONE);
 
         state.stickMovedThisTick = (rsX != 0f || rsY != 0f);
 
         if (state.stickMovedThisTick) {
-            state.cursorGuiX = clamp(state.cursorGuiX + rsX  * GUI_CURSOR_SPEED, 0, scaledW - 1);
+            state.cursorGuiX = clamp(state.cursorGuiX +  rsX * GUI_CURSOR_SPEED, 0, scaledW - 1);
             state.cursorGuiY = clamp(state.cursorGuiY + -rsY * GUI_CURSOR_SPEED, 0, scaledH - 1);
         }
 
-        // These are the coords every GuiScreen method expects
         int mouseX = (int) state.cursorGuiX;
         int mouseY = (int) state.cursorGuiY;
 
-        //   A button: click or drag   ─
-        if (curA && !prevA) {
+        //  A: click / drag 
+        if (cs.a && !prevA) {
             aHeldSince = System.currentTimeMillis();
             isDragging = false;
             simulateMouseClick(screen, mouseX, mouseY, 0);
-        } else if (curA && prevA) {
+        } else if (cs.a && prevA) {
             if (System.currentTimeMillis() - aHeldSince > DRAG_THRESHOLD_MS) {
                 isDragging = true;
                 simulateMouseDrag(screen, mouseX, mouseY, 0);
             }
-        } else if (!curA && prevA) {
+        } else if (!cs.a && prevA) {
             if (isDragging) simulateMouseRelease(screen, mouseX, mouseY, 0);
             isDragging = false;
         }
 
-        //   B: right-click        
-        if (curB && !prevB) simulateMouseClick(screen, mouseX, mouseY, 1);
+        //  B: right-click 
+        if (cs.b && !prevB) simulateMouseClick(screen, mouseX, mouseY, 1);
 
-        //   Y: shift-click        
-        if (curY && !prevY && screen instanceof GuiContainer)
+        //  Y: shift-click 
+        if (cs.y && !prevY && screen instanceof GuiContainer)
             shiftClickSlotAt((GuiContainer) screen, mouseX, mouseY);
 
-        //   X: close screen       ─
-        if (curX && !prevX) {
+        //  X / Start / Back: close 
+        if ((cs.x && !prevX) || (cs.start && !prevStart) || (cs.back && !prevBack))
             closeGuiProperly(screen);
-        }
 
-        //   Start / Back: escape     
-        if ((curStart && !prevStart) || (curBack && !prevBack)) {
-            closeGuiProperly(screen);
-        }
+        //  LB/RB: scroll 
+        if (cs.lb && !prevLB) simulateScroll(screen, mouseX, mouseY,  1);
+        if (cs.rb && !prevRB) simulateScroll(screen, mouseX, mouseY, -1);
 
-        //   LB/RB: scroll        ─
-        if (curLB && !prevLB) simulateScroll(screen, mouseX, mouseY,  1);
-        if (curRB && !prevRB) simulateScroll(screen, mouseX, mouseY, -1);
-
-        //   D-pad: hotbar        ─
-        if (curDpadLeft  && !prevDpadLeft  && mc.thePlayer != null)
+        //  D-pad: hotbar 
+        if (cs.dpadLeft  && !prevDpadLeft  && mc.thePlayer != null)
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 8) % 9;
-        if (curDpadRight && !prevDpadRight && mc.thePlayer != null)
+        if (cs.dpadRight && !prevDpadRight && mc.thePlayer != null)
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 1) % 9;
     }
 
@@ -347,11 +412,22 @@ public class XInputTickHandler implements ITickHandler {
     // Helpers
     // =========================================================================
 
+    private static float processAxis(float v, float dz) {
+        float abs = Math.abs(v);
+        if (abs <= dz) return 0f;
+        float sign = v < 0 ? -1f : 1f;
+        float norm = (abs - dz) / (1f - dz);
+        return sign * norm * norm;
+    }
+
+    private static float clamp(float v, float min, float max) {
+        return v < min ? min : (v > max ? max : v);
+    }
+
     private ScaledResolution getScaledResolution() {
         try {
             return new ScaledResolution(mc.gameSettings, mc.displayWidth, mc.displayHeight);
         } catch (Throwable t) {
-            // Fallback — return a dummy that reports 1:1 scale
             return new ScaledResolution(mc.gameSettings, mc.displayWidth, mc.displayHeight) {
                 @Override public int getScaleFactor() { return 1; }
                 @Override public int getScaledWidth()  { return mc.displayWidth; }
@@ -393,7 +469,6 @@ public class XInputTickHandler implements ITickHandler {
         if (guiMethodsResolved) return;
         guiMethodsResolved = true;
         try {
-            //   All (int,int,int) void methods — covers mouseClicked + mouseMovedOrUp
             for (Method m : GuiScreen.class.getDeclaredMethods()) {
                 Class<?>[] p = m.getParameterTypes();
                 if (p.length == 3
@@ -404,7 +479,6 @@ public class XInputTickHandler implements ITickHandler {
                 }
             }
 
-            //   mouseClickMove: (int, int, int, long) void           
             for (Method m : GuiScreen.class.getDeclaredMethods()) {
                 Class<?>[] p = m.getParameterTypes();
                 if (p.length == 4
@@ -417,7 +491,6 @@ public class XInputTickHandler implements ITickHandler {
                 }
             }
 
-            //   actionPerformed: (GuiButton) void  
             for (Class<?> cls = GuiScreen.class; cls != null; cls = cls.getSuperclass()) {
                 for (Method m : cls.getDeclaredMethods()) {
                     Class<?>[] p = m.getParameterTypes();
@@ -431,7 +504,6 @@ public class XInputTickHandler implements ITickHandler {
                 if (cachedActionPerf != null) break;
             }
 
-            //   buttonList: first List field on GuiScreen  
             for (Field f : GuiScreen.class.getDeclaredFields()) {
                 if (java.util.List.class.isAssignableFrom(f.getType())) {
                     f.setAccessible(true);
@@ -440,7 +512,6 @@ public class XInputTickHandler implements ITickHandler {
                 }
             }
 
-            //   GuiButton int fields: id(0) width(1) height(2) xPosition(3) yPosition(4)
             List<Field> intFields = new java.util.ArrayList<Field>();
             for (Field f : GuiButton.class.getDeclaredFields()) {
                 if (f.getType() == int.class) {
@@ -448,6 +519,7 @@ public class XInputTickHandler implements ITickHandler {
                     intFields.add(f);
                 }
             }
+            // MCP field order: id(0) width(1) height(2) xPosition(3) yPosition(4)
             if (intFields.size() >= 5) {
                 cachedBtnW = intFields.get(1);
                 cachedBtnH = intFields.get(2);
@@ -467,15 +539,12 @@ public class XInputTickHandler implements ITickHandler {
 
     private void simulateMouseClick(GuiScreen screen, int mouseX, int mouseY, int button) {
         resolveGuiMethods();
-        // Call every (int,int,int) void method — one of them is mouseClicked.
-        // Calling mouseMovedOrUp on press is a no-op in vanilla so this is safe.
         boolean called = false;
         for (Method m : cachedTripleIntMethods) {
             try { m.invoke(screen, mouseX, mouseY, button); called = true; }
             catch (Throwable ignored) {}
         }
         if (called) return;
-        // Hard fallback: find button under cursor and fire actionPerformed
         if (cachedButtonList != null && cachedActionPerf != null) {
             try {
                 @SuppressWarnings("unchecked")
@@ -493,17 +562,14 @@ public class XInputTickHandler implements ITickHandler {
     private void simulateMouseDrag(GuiScreen screen, int mouseX, int mouseY, int button) {
         resolveGuiMethods();
         if (cachedMouseDrag != null) {
-            try {
-                cachedMouseDrag.invoke(screen, mouseX, mouseY, button,
-                    System.currentTimeMillis() - aHeldSince);
-            } catch (Throwable ignored) {}
+            try { cachedMouseDrag.invoke(screen, mouseX, mouseY, button,
+                System.currentTimeMillis() - aHeldSince); }
+            catch (Throwable ignored) {}
         }
     }
 
     private void simulateMouseRelease(GuiScreen screen, int mouseX, int mouseY, int button) {
         resolveGuiMethods();
-        // Same as simulateMouseClick — call all (int,int,int) void methods.
-        // mouseMovedOrUp is in this set and will fire correctly.
         for (Method m : cachedTripleIntMethods) {
             try { m.invoke(screen, mouseX, mouseY, button); }
             catch (Throwable ignored) {}
@@ -550,18 +616,6 @@ public class XInputTickHandler implements ITickHandler {
             shiftClickSlotAt((GuiContainer) screen, mouseX, mouseY);
     }
 
-    /**
-     * Properly close a GUI screen, returning any held crafting items to inventory.
-     *
-     * The bug: calling mc.displayGuiScreen(null) directly skips the container
-     * close sequence. For GuiContainer screens (inventory, crafting, chests),
-     * we must call mc.thePlayer.closeScreen() instead, which:
-     *   1. Calls container.onContainerClosed(player) — drops crafting items back
-     *   2. Sends the CloseWindow packet to the server
-     *   3. Calls mc.displayGuiScreen(null) internally
-     *
-     * For non-container screens (title, pause, chat) the direct path is fine.
-     */
     private void closeGuiProperly(GuiScreen screen) {
         if (screen instanceof GuiContainer && mc.thePlayer != null) {
             mc.thePlayer.closeScreen();
