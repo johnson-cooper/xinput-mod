@@ -7,9 +7,11 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.ScaledResolution;
 import net.minecraft.entity.player.EntityPlayer;
 
+import org.lwjgl.input.Cursor;
 import org.lwjgl.input.Mouse;
 import org.lwjgl.opengl.GL11;
 
+import java.nio.IntBuffer;
 import java.util.EnumSet;
 
 /**
@@ -27,7 +29,7 @@ public class XInputGuiRenderer implements ITickHandler {
     private final Minecraft mc;
     private final XInputSharedState state;
 
-    // Camera tuning
+    //  Camera tuning 
     private static final float SMOOTH_ALPHA   = 0.18f;
     private static final float LOOK_SCALE     = 6.0f;
     private static final float LOOK_MAX_DELTA = 12.0f;
@@ -36,9 +38,16 @@ public class XInputGuiRenderer implements ITickHandler {
     private float smoothRx = 0f;
     private float smoothRy = 0f;
 
-    // Crosshair drawing constants 
+    //  Crosshair drawing constants 
     private static final int CROSS_ARM = 6;
     private static final int CROSS_GAP = 2;
+
+    // Shared with XInputTickHandler   set after both are constructed
+    XInputTickHandler tickHandler = null;
+
+    //  Blank cursor (hides OS cursor while our GUI crosshair is shown) 
+    private Cursor blankCursor  = null;
+    private boolean cursorHidden = false;
 
     public XInputGuiRenderer(Minecraft mc, XInputSharedState state) {
         this.mc    = mc;
@@ -56,11 +65,24 @@ public class XInputGuiRenderer implements ITickHandler {
 
     @Override
     public void tickStart(EnumSet<TickType> type, Object... tickData) {
-       
+        // Apply camera look at the START of the render tick   before vanilla
+        // draws the frame   so the rotation values are ready before rendering.
         applyControllerLook();
+    }
 
-        // GUI cursor work only when a screen is open
-        if (mc.currentScreen == null) return;
+    @Override
+    public void tickEnd(EnumSet<TickType> type, Object... tickData) {
+        // Draw GUI overlays at the END of the render tick, after vanilla has
+        // already painted the GUI screen   so our crosshair and recipe browser
+        // appear on top rather than being painted over.
+        if (mc.currentScreen == null) {
+            // No GUI open   restore the real cursor if we hid it
+            showOsCursor();
+            return;
+        }
+
+        // Hide the OS cursor and show our crosshair instead
+        hideOsCursor();
 
         if (state.stickMovedThisTick) {
             warpOsCursor();
@@ -68,10 +90,14 @@ public class XInputGuiRenderer implements ITickHandler {
         }
 
         drawCrosshair((int) state.cursorGuiX, (int) state.cursorGuiY);
-    }
 
-    @Override
-    public void tickEnd(EnumSet<TickType> type, Object... tickData) {}
+        //  Recipe browser overlay 
+        if (tickHandler != null && tickHandler.recipeBrowser.isOpen) {
+            ScaledResolution sr = new ScaledResolution(
+                mc.gameSettings, mc.displayWidth, mc.displayHeight);
+            tickHandler.recipeBrowser.render(sr.getScaledWidth(), sr.getScaledHeight());
+        }
+    }
 
     @Override
     public String getLabel() { return "XInputGuiRenderer"; }
@@ -114,6 +140,28 @@ public class XInputGuiRenderer implements ITickHandler {
     // =========================================================================
     // GUI cursor
     // =========================================================================
+
+    private void hideOsCursor() {
+        if (cursorHidden) return;
+        try {
+            if (blankCursor == null) {
+                // Create a 1x1 transparent cursor   the minimum LWJGL allows
+                IntBuffer buf = org.lwjgl.BufferUtils.createIntBuffer(1);
+                buf.put(0, 0x00000000); // fully transparent pixel
+                blankCursor = new Cursor(1, 1, 0, 0, 1, buf, null);
+            }
+            Mouse.setNativeCursor(blankCursor);
+            cursorHidden = true;
+        } catch (Throwable ignored) {}
+    }
+
+    private void showOsCursor() {
+        if (!cursorHidden) return;
+        try {
+            Mouse.setNativeCursor(null); // null restores the default OS cursor
+            cursorHidden = false;
+        } catch (Throwable ignored) {}
+    }
 
     private void warpOsCursor() {
         try {

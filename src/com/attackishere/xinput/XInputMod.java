@@ -15,7 +15,15 @@ public class XInputMod {
     @Init
     public void init(FMLInitializationEvent event) {
         Minecraft mc = Minecraft.getMinecraft();
-        TickRegistry.registerTickHandler(new XInputTickHandler(sharedState), Side.CLIENT);
-        TickRegistry.registerTickHandler(new XInputGuiRenderer(mc, sharedState), Side.CLIENT);
+
+        XInputTickHandler tickHandler   = new XInputTickHandler(sharedState);
+        XInputGuiRenderer guiRenderer   = new XInputGuiRenderer(mc, sharedState);
+
+        // Give the renderer a reference to the tick handler so it can
+        // call recipeBrowser.render() each frame.
+        guiRenderer.tickHandler = tickHandler;
+
+        TickRegistry.registerTickHandler(tickHandler, Side.CLIENT);
+        TickRegistry.registerTickHandler(guiRenderer, Side.CLIENT);
     }
 }

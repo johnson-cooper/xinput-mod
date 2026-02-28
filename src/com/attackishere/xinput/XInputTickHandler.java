@@ -37,6 +37,9 @@ public class XInputTickHandler implements ITickHandler {
     // Normalised state filled each tick by whichever backend is active
     private final ControllerState cs = new ControllerState();
 
+    //  Recipe browser 
+    final RecipeBrowser recipeBrowser = new RecipeBrowser(Minecraft.getMinecraft());
+
     //  Tuning 
     private static final float MOVE_DEADZONE       = 0.25f;
     private static final float GUI_CURSOR_DEADZONE = 0.15f;
@@ -53,6 +56,10 @@ public class XInputTickHandler implements ITickHandler {
     private boolean isDragging = false;
     private long    aHeldSince = 0;
     private static final long DRAG_THRESHOLD_MS = 200;
+
+    //  Auto-craft state (Y hold) 
+    private long yCraftLastFired  = 0;
+    private static final long CRAFT_INTERVAL_MS = 150;
 
     //  Misc 
     private int dropFrameCounter = 0;
@@ -94,6 +101,7 @@ public class XInputTickHandler implements ITickHandler {
             state.cursorInitialised  = false;
             state.stickMovedThisTick = false;
             isDragging = false;
+            recipeBrowser.close(); // always close browser when exiting a GUI
             handleGameplay();
         }
 
@@ -358,6 +366,30 @@ public class XInputTickHandler implements ITickHandler {
             state.cursorInitialised = true;
         }
 
+        //  Back: toggle recipe browser (containers only) or close screen 
+        // Checked first so the toggle fires before any other input is processed.
+        if (cs.back && !prevBack) {
+            if (screen instanceof GuiContainer) {
+                if (recipeBrowser.isOpen) recipeBrowser.close();
+                else                      recipeBrowser.open();
+            } else {
+                closeGuiProperly(screen);
+            }
+        }
+
+        //  Recipe browser: consume all input while open 
+        if (recipeBrowser.isOpen) {
+            if (cs.dpadUp   && !prevDpadUp)   recipeBrowser.scroll(-1);
+            if (cs.dpadDown && !prevDpadDown)  recipeBrowser.scroll( 1);
+            if (cs.a        && !prevA)         recipeBrowser.confirm();
+            if (cs.b        && !prevB)         recipeBrowser.close();
+            if (cs.x        && !prevX)         recipeBrowser.close();
+            if (cs.start    && !prevStart)     recipeBrowser.close();
+            // Do not process any other GUI input while browser is open
+            return;
+        }
+
+        //  Left stick: free analog cursor movement 
         float rsX = processAxis(cs.lx, GUI_CURSOR_DEADZONE);
         float rsY = processAxis(cs.ly, GUI_CURSOR_DEADZONE);
 
@@ -367,6 +399,12 @@ public class XInputTickHandler implements ITickHandler {
             state.cursorGuiX = clamp(state.cursorGuiX +  rsX * GUI_CURSOR_SPEED, 0, scaledW - 1);
             state.cursorGuiY = clamp(state.cursorGuiY + -rsY * GUI_CURSOR_SPEED, 0, scaledH - 1);
         }
+
+        //  D-pad: hotbar cycling in all GUI screens 
+        if (cs.dpadLeft  && !prevDpadLeft  && mc.thePlayer != null)
+            mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 8) % 9;
+        if (cs.dpadRight && !prevDpadRight && mc.thePlayer != null)
+            mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 1) % 9;
 
         int mouseX = (int) state.cursorGuiX;
         int mouseY = (int) state.cursorGuiY;
@@ -393,19 +431,13 @@ public class XInputTickHandler implements ITickHandler {
         if (cs.y && !prevY && screen instanceof GuiContainer)
             shiftClickSlotAt((GuiContainer) screen, mouseX, mouseY);
 
-        //  X / Start / Back: close 
-        if ((cs.x && !prevX) || (cs.start && !prevStart) || (cs.back && !prevBack))
+        //  X / Start: close 
+        if ((cs.x && !prevX) || (cs.start && !prevStart))
             closeGuiProperly(screen);
 
         //  LB/RB: scroll 
         if (cs.lb && !prevLB) simulateScroll(screen, mouseX, mouseY,  1);
         if (cs.rb && !prevRB) simulateScroll(screen, mouseX, mouseY, -1);
-
-        //  D-pad: hotbar 
-        if (cs.dpadLeft  && !prevDpadLeft  && mc.thePlayer != null)
-            mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 8) % 9;
-        if (cs.dpadRight && !prevDpadRight && mc.thePlayer != null)
-            mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 1) % 9;
     }
 
     // =========================================================================
@@ -586,28 +618,46 @@ public class XInputTickHandler implements ITickHandler {
         } catch (Throwable ignored) { return false; }
     }
 
+    // Cached slot-lookup method (obfuscation-safe, resolved by signature)
+    private Method cachedSlotMethod = null;
+
+    /**
+     * Find the slot under (mouseX, mouseY) in scaled GUI coords.
+     * Returns null if no slot is there or lookup fails.
+     * Uses the same (int,int)->Slot signature search as before, but extracted
+     * so both shiftClickSlotAt and the auto-craft hold check can use it.
+     */
+    private Slot getSlotAt(GuiContainer gui, int mouseX, int mouseY) {
+        try {
+            if (cachedSlotMethod == null) {
+                for (Method m : GuiContainer.class.getDeclaredMethods())
+                    if (m.getParameterTypes().length == 2
+                            && (m.getReturnType() == Slot.class
+                                || m.getReturnType().getSimpleName().equals("Slot"))) {
+                        m.setAccessible(true); cachedSlotMethod = m; break;
+                    }
+                if (cachedSlotMethod == null)
+                    for (Method m : gui.getClass().getMethods())
+                        if (m.getParameterTypes().length == 2
+                                && m.getReturnType().getSimpleName().equals("Slot")) {
+                            m.setAccessible(true); cachedSlotMethod = m; break;
+                        }
+            }
+            if (cachedSlotMethod != null) {
+                Object s = cachedSlotMethod.invoke(gui, mouseX, mouseY);
+                if (s instanceof Slot) return (Slot) s;
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
     private void shiftClickSlotAt(GuiContainer gui, int mouseX, int mouseY) {
         try {
-            Method slotMethod = null;
-            for (Method m : GuiContainer.class.getDeclaredMethods())
-                if (m.getParameterTypes().length == 2
-                        && (m.getReturnType() == Slot.class
-                            || m.getReturnType().getSimpleName().equals("Slot"))) {
-                    slotMethod = m; slotMethod.setAccessible(true); break;
-                }
-            if (slotMethod == null)
-                for (Method m : gui.getClass().getMethods())
-                    if (m.getParameterTypes().length == 2
-                            && m.getReturnType().getSimpleName().equals("Slot")) {
-                        slotMethod = m; slotMethod.setAccessible(true); break;
-                    }
-            if (slotMethod != null) {
-                Object s = slotMethod.invoke(gui, mouseX, mouseY);
-                if (s instanceof Slot)
-                    mc.playerController.windowClick(
-                        mc.thePlayer.openContainer.windowId,
-                        ((Slot) s).slotNumber, 0, 1, mc.thePlayer);
-            }
+            Slot s = getSlotAt(gui, mouseX, mouseY);
+            if (s != null)
+                mc.playerController.windowClick(
+                    mc.thePlayer.openContainer.windowId,
+                    s.slotNumber, 0, 1, mc.thePlayer);
         } catch (Throwable t) { log("shiftClickSlotAt failed: " + t); }
     }
 
