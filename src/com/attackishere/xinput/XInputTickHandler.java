@@ -80,6 +80,9 @@ public class XInputTickHandler implements ITickHandler {
 
     @Override
     public void tickStart(EnumSet<TickType> types, Object... tickData) {
+    	if (!XInputMod.modEnabled) {
+            return; 
+        }
         boolean ok = pollController();
         if (!ok) {
             state.rawRx = 0f;
