@@ -345,11 +345,8 @@ public class XInputTickHandler implements ITickHandler {
         if (cs.back  && !prevBack && mc.thePlayer != null)
             mc.displayGuiScreen(new GuiChat());
 
-        if (dropFrameCounter > 0) {
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindDrop.keyCode, true);
-            dropFrameCounter--;
-        } else {
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindDrop.keyCode, false);
+        if (cs.b && !prevB && mc.thePlayer != null) {
+            mc.thePlayer.dropOneItem(false); // drop single item
         }
     }
 
