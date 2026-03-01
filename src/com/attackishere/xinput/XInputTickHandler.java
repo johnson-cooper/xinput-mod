@@ -24,17 +24,12 @@ public class XInputTickHandler implements ITickHandler {
     private final XInputSharedState state;
 
     //  Controller backends 
-    // JInput is tried first — it ships bundled with Minecraft's LWJGL, so
-    // no extra dependencies are needed and it works on Windows/macOS/Linux.
-    // JXInput is used as a fallback on Windows if JInput's environment is
-    // broken (e.g. RawInput NPE on certain HID devices like ITE Device).
     private final JInputController jinput = new JInputController();
     private boolean jinputPermanentlyFailed = false;
-    private Object jxController = null;   // XInputDevice, held as Object to avoid hard dep
+    private Object jxController = null;
     private boolean jxInitAttempted = false;
     private boolean usingJXInput = false;
 
-    // Normalised state filled each tick by whichever backend is active
     private final ControllerState cs = new ControllerState();
 
     //  Recipe browser 
@@ -61,8 +56,10 @@ public class XInputTickHandler implements ITickHandler {
     private long yCraftLastFired  = 0;
     private static final long CRAFT_INTERVAL_MS = 150;
 
+    //    Screen tracking (cursor re-centres when screen changes)               
+    private GuiScreen lastScreen = null;
+
     //  Misc 
-    private int dropFrameCounter = 0;
     private int debugCounter     = 0;
 
     public XInputTickHandler(XInputSharedState state) {
@@ -80,9 +77,7 @@ public class XInputTickHandler implements ITickHandler {
 
     @Override
     public void tickStart(EnumSet<TickType> types, Object... tickData) {
-    	if (!XInputMod.modEnabled) {
-            return; 
-        }
+        if (!XInputMod.modEnabled) return;
         boolean ok = pollController();
         if (!ok) {
             state.rawRx = 0f;
@@ -99,12 +94,12 @@ public class XInputTickHandler implements ITickHandler {
         if (inGui) {
             handleGui();
             releaseMovementKeys();
-            dropFrameCounter = 0;
         } else {
             state.cursorInitialised  = false;
             state.stickMovedThisTick = false;
             isDragging = false;
-            recipeBrowser.close(); // always close browser when exiting a GUI
+            lastScreen = null;
+            recipeBrowser.close();
             handleGameplay();
         }
 
@@ -136,7 +131,7 @@ public class XInputTickHandler implements ITickHandler {
      *      broken by a bad HID device like ITE Device causing a RawInput NPE)
      */
     private boolean pollController() {
-        //  Try JInput first 
+        //    Try JInput first                                                   
         if (!usingJXInput && !jinputPermanentlyFailed) {
             JInputController.InitResult result = jinput.init();
             if (result == JInputController.InitResult.OK) {
@@ -155,7 +150,7 @@ public class XInputTickHandler implements ITickHandler {
             // keep retrying JInput in case controller is plugged in later.
         }
 
-        //  JInput unavailable — try JXInput (Windows only) 
+        //    JInput unavailable — try JXInput (Windows only)                    
         if (!usingJXInput && !jxInitAttempted) {
             jxInitAttempted = true;
             jxController = initJXInput();
@@ -181,7 +176,7 @@ public class XInputTickHandler implements ITickHandler {
         return false;
     }
 
-    //  JXInput via reflection 
+    //    JXInput via reflection                                                 
     // All JXInput access goes through reflection so the mod compiles and loads
     // on macOS/Linux where the JXInput classes aren't present at all.
 
@@ -321,7 +316,7 @@ public class XInputTickHandler implements ITickHandler {
         }
 
         KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, cs.a);
-        if (cs.b && !prevB) dropFrameCounter = 2;
+        if (cs.b && !prevB && mc.thePlayer != null) mc.thePlayer.dropOneItem(false);
         if (cs.x && !prevX && mc.thePlayer != null)
             mc.displayGuiScreen(new GuiInventory(mc.thePlayer));
 
@@ -345,9 +340,6 @@ public class XInputTickHandler implements ITickHandler {
         if (cs.back  && !prevBack && mc.thePlayer != null)
             mc.displayGuiScreen(new GuiChat());
 
-        if (cs.b && !prevB && mc.thePlayer != null) {
-            mc.thePlayer.dropOneItem(false); // drop single item
-        }
     }
 
     // =========================================================================
@@ -360,13 +352,15 @@ public class XInputTickHandler implements ITickHandler {
         int scaledW = sr.getScaledWidth();
         int scaledH = sr.getScaledHeight();
 
-        if (!state.cursorInitialised) {
+        // Re-centre cursor whenever the active screen changes
+        if (!state.cursorInitialised || screen != lastScreen) {
             state.cursorGuiX       = scaledW / 2f;
             state.cursorGuiY       = scaledH / 2f;
             state.cursorInitialised = true;
+            lastScreen = screen;
         }
 
-        //  Back: toggle recipe browser (containers only) or close screen 
+        //    Back: toggle recipe browser (containers only) or close screen      
         // Checked first so the toggle fires before any other input is processed.
         if (cs.back && !prevBack) {
             if (screen instanceof GuiContainer) {
@@ -377,7 +371,7 @@ public class XInputTickHandler implements ITickHandler {
             }
         }
 
-        //  Recipe browser: consume all input while open 
+        //    Recipe browser: consume all input while open                       
         if (recipeBrowser.isOpen) {
             if (cs.dpadUp   && !prevDpadUp)   recipeBrowser.scroll(-1);
             if (cs.dpadDown && !prevDpadDown)  recipeBrowser.scroll( 1);
@@ -389,7 +383,7 @@ public class XInputTickHandler implements ITickHandler {
             return;
         }
 
-        //  Left stick: free analog cursor movement 
+        //    Left stick: free analog cursor movement                            
         float rsX = processAxis(cs.lx, GUI_CURSOR_DEADZONE);
         float rsY = processAxis(cs.ly, GUI_CURSOR_DEADZONE);
 
@@ -400,7 +394,7 @@ public class XInputTickHandler implements ITickHandler {
             state.cursorGuiY = clamp(state.cursorGuiY + -rsY * GUI_CURSOR_SPEED, 0, scaledH - 1);
         }
 
-        //  D-pad: hotbar cycling in all GUI screens 
+        //    D-pad: hotbar cycling in all GUI screens                           
         if (cs.dpadLeft  && !prevDpadLeft  && mc.thePlayer != null)
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 8) % 9;
         if (cs.dpadRight && !prevDpadRight && mc.thePlayer != null)
@@ -409,7 +403,7 @@ public class XInputTickHandler implements ITickHandler {
         int mouseX = (int) state.cursorGuiX;
         int mouseY = (int) state.cursorGuiY;
 
-        //  A: click / drag 
+        //    A: click / drag                                                    
         if (cs.a && !prevA) {
             aHeldSince = System.currentTimeMillis();
             isDragging = false;
@@ -424,18 +418,22 @@ public class XInputTickHandler implements ITickHandler {
             isDragging = false;
         }
 
-        //  B: right-click 
+        //    B: right-click                                                     
         if (cs.b && !prevB) simulateMouseClick(screen, mouseX, mouseY, 1);
 
-        //  Y: shift-click 
+        //    Y: shift-click                                                     
         if (cs.y && !prevY && screen instanceof GuiContainer)
             shiftClickSlotAt((GuiContainer) screen, mouseX, mouseY);
 
-        //  X / Start: close 
-        if ((cs.x && !prevX) || (cs.start && !prevStart))
+        //    X: close screen                                                   
+        if (cs.x && !prevX)
             closeGuiProperly(screen);
 
-        //  LB/RB: scroll 
+        //    Start: close in-game GUIs; do nothing on title screen (no player)    
+        if (cs.start && !prevStart && mc.thePlayer != null)
+            closeGuiProperly(screen);
+
+        //    LB/RB: scroll                                                      
         if (cs.lb && !prevLB) simulateScroll(screen, mouseX, mouseY,  1);
         if (cs.rb && !prevRB) simulateScroll(screen, mouseX, mouseY, -1);
     }
@@ -667,13 +665,17 @@ public class XInputTickHandler implements ITickHandler {
     }
 
     private void closeGuiProperly(GuiScreen screen) {
+        if (screen == null) return;
         if (screen instanceof GuiContainer && mc.thePlayer != null) {
             mc.thePlayer.closeScreen();
-        } else {
+        } else if (mc.thePlayer != null) {
+            // In-game non-container screen (chat, pause menu, etc.)
             try { screen.onGuiClosed(); } catch (Throwable ignored) {}
             mc.displayGuiScreen(null);
             mc.setIngameFocus();
         }
+        // If thePlayer is null (title screen) we don't try to close anything —
+        // the title screen manages its own lifecycle.
     }
 
     private void openPauseMenu() {
