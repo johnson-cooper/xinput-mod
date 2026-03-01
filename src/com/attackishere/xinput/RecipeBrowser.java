@@ -21,7 +21,6 @@ import java.lang.reflect.Field;
 import java.util.*;
 
 public class RecipeBrowser {
-	
 
     private final Minecraft mc;
 
@@ -30,11 +29,11 @@ public class RecipeBrowser {
     private int selectedIndex = 0;
     private int scrollOffset = 0;
 
- // UPDATED CONSTANTS
-    private static final int VISIBLE_ROWS = 8; // More rows, but shorter ones
-    private static final int PANEL_W = 120;    // Slimmer (was 160)
-    private static final int ROW_H = 16;       // Shorter rows (was 20)
-    private static final int PANEL_H = VISIBLE_ROWS * ROW_H + 26; // Recalculated height
+    // UPDATED CONSTANTS
+    private static final int VISIBLE_ROWS = 8;
+    private static final int PANEL_W = 120;
+    private static final int ROW_H = 16;
+    private static final int PANEL_H = VISIBLE_ROWS * ROW_H + 26;
     private static final RenderItem itemRenderer = new RenderItem();
     private static final int MAX_RECURSION_DEPTH = 0;
 
@@ -79,43 +78,36 @@ public class RecipeBrowser {
     public void render(int scaledW, int scaledH) {
         if (!isOpen) return;
         FontRenderer fr = mc.fontRenderer;
-        
-        // Positioned on the left
-        int panelX = 4; 
+
+        int panelX = 4;
         int panelY = 4;
 
-        // 1. Background (using the new smaller PANEL_W and PANEL_H)
         drawRect(panelX - 2, panelY - 2, panelX + PANEL_W + 2, panelY + PANEL_H + 2, 0xCC000000);
         drawRect(panelX - 1, panelY - 1, panelX + PANEL_W + 1, panelY + PANEL_H + 1, 0xFF444444);
 
-        // 2. Header (Slightly smaller text scaling if needed, but standard is fine here)
         String header = craftableRecipes.isEmpty() ? "No Recipes" : "Craft (" + craftableRecipes.size() + ")";
         fr.drawStringWithShadow(header, panelX + 2, panelY + 2, 0xFFFFAA00);
         drawRect(panelX, panelY + 11, panelX + PANEL_W, panelY + 12, 0xFF666666);
 
-        // 3. Compact Recipe List
         int rowY = panelY + 14;
         for (int i = 0; i < VISIBLE_ROWS; i++) {
             int idx = scrollOffset + i;
             if (idx >= craftableRecipes.size()) break;
-            
+
             IRecipe recipe = craftableRecipes.get(idx);
             ItemStack output = recipe.getRecipeOutput();
             if (output == null) continue;
 
             boolean selected = (idx == selectedIndex);
             if (selected) {
-                // Highlight bar adjusted for new ROW_H
                 drawRect(panelX, rowY - 1, panelX + PANEL_W, rowY + ROW_H - 1, 0x66FFFFFF);
             }
 
-            // Render item slightly smaller or shifted to fit slim row
-            renderItemStack(output, panelX + 2, rowY - 1); 
-            
+            renderItemStack(output, panelX + 2, rowY - 1);
+
             String name = output.getDisplayName();
             if (output.stackSize > 1) name = output.stackSize + "x " + name;
 
-            // Truncate text earlier since the panel is now much thinner
             int maxWidth = PANEL_W - 22;
             if (fr.getStringWidth(name) > maxWidth) {
                 while (name.length() > 3 && fr.getStringWidth(name + "..") > maxWidth) {
@@ -124,16 +116,13 @@ public class RecipeBrowser {
                 name += "..";
             }
 
-            // Draw name slightly higher to center in the 16px row
             fr.drawStringWithShadow(name, panelX + 20, rowY + 3, selected ? 0xFFFFFF00 : 0xFFFFFFFF);
-            
-            rowY += ROW_H; // Move down by the new compact row height
+
+            rowY += ROW_H;
         }
 
-        // 4. Footer
         int footerY = panelY + PANEL_H - 10;
         drawRect(panelX, footerY - 2, panelX + PANEL_W, footerY - 1, 0xFF666666);
-        // Shortened footer text to fit narrow width
         fr.drawStringWithShadow("\u2191\u2193 [A]Craft [B]Exit", panelX + 2, footerY, 0xFF888888);
     }
 
@@ -331,8 +320,6 @@ public class RecipeBrowser {
             tempAvailable.put(exact, c - 1);
             return true;
         }
-
-        // Vanilla Wildcard logic cleanly isolated (No OreDict pollution here)
         if (need.getItemDamage() == 32767 || need.getItemDamage() == -1) {
             int itemID = need.itemID;
             Long chosenKey = null;
@@ -354,10 +341,12 @@ public class RecipeBrowser {
     private ItemStack resolveOreIngredientPreferPlayer(Object obj) {
         if (obj == null) return null;
         if (obj instanceof ItemStack) return (ItemStack) obj;
-        
+
         List<ItemStack> alts = null;
         if (obj instanceof java.util.List) {
-            alts = (java.util.List<ItemStack>) obj;
+            @SuppressWarnings("unchecked")
+            List<ItemStack> cast = (java.util.List<ItemStack>) obj;
+            alts = cast;
         } else if (obj instanceof String) {
             alts = OreDictionary.getOres((String) obj);
         }
@@ -412,9 +401,6 @@ public class RecipeBrowser {
         return stack.getItemDamage() == needDmg;
     }
 
-    // =====================================================================
-    // Highly Reliable Dimensions Extraction (Fixes "Nothing Happened" Bug)
-    // =====================================================================
     private int[] getShapedDimensions(ShapedRecipes recipe) {
         int[] dims = new int[] {-1, -1};
         try {
@@ -427,16 +413,16 @@ public class RecipeBrowser {
                 }
             }
         } catch (Throwable t) {}
-        
+
         ItemStack[] items = getShapedIngredients(recipe);
         int len = items != null ? items.length : 0;
-        
+
         if ((dims[0] <= 0 || dims[1] <= 0) && len > 0) {
             if (len == 1) { dims[0] = 1; dims[1] = 1; }
-            else if (len == 2) { dims[0] = 1; dims[1] = 2; } 
-            else if (len == 3) { dims[0] = 3; dims[1] = 1; } 
+            else if (len == 2) { dims[0] = 1; dims[1] = 2; }
+            else if (len == 3) { dims[0] = 3; dims[1] = 1; }
             else if (len == 4) { dims[0] = 2; dims[1] = 2; }
-            else if (len == 6) { dims[0] = 3; dims[1] = 2; } 
+            else if (len == 6) { dims[0] = 3; dims[1] = 2; }
             else if (len == 9) { dims[0] = 3; dims[1] = 3; }
         }
         return dims;
@@ -454,10 +440,10 @@ public class RecipeBrowser {
                 }
             }
         } catch (Throwable t) {}
-        
+
         Object[] items = getShapedOrePatternObjects(recipe);
         int len = items != null ? items.length : 0;
-        
+
         if ((dims[0] <= 0 || dims[1] <= 0) && len > 0) {
             if (len == 1) { dims[0] = 1; dims[1] = 1; }
             else if (len == 2) { dims[0] = 1; dims[1] = 2; }
@@ -519,29 +505,103 @@ public class RecipeBrowser {
         return null;
     }
 
+    // =========================================================================
+    // Slot detection  obfuscation-safe, class-name-free.
+    //
+    // In a 1.4.7 obfuscated jar ALL class simple names are single letters (sq,
+    // sr, etc.) so we cannot use string matching like "SlotCrafting". Instead
+    // we detect slots structurally:
+    //
+    //   SlotCrafting   the output slot; it is the ONLY slot whose class differs
+    //                   from the plain grid-slot class.  In ContainerPlayer the
+    //                   layout is [0]=output [1-4]=2x2 grid [5-8]=armor [9+]=inv.
+    //                   In ContainerWorkbench: [0]=output [1-9]=3x3 grid [10+]=inv.
+    //
+    //   Strategy 1: Find the first slot whose class is unique (appears exactly
+    //               once in the first ~15 slots). That is the output. The next
+    //               4 or 9 slots of the MAJORITY class are the inputs.
+    //
+    //   Strategy 2: If that fails, take slots [1..4] or [1..9] and verify they
+    //               all share the same class (plain grid slots).
+    // =========================================================================
     private List<Slot> findCraftingInputSlots(GuiContainer gui) {
         try {
             List<Slot> allSlots = mc.thePlayer.openContainer.inventorySlots;
             if (allSlots == null || allSlots.isEmpty()) return null;
-            int outputIdx = -1;
-            for (int i = 0; i < allSlots.size(); i++) {
-                if (allSlots.get(i).getClass().getSimpleName().equals("SlotCrafting")) {
-                    outputIdx = i;
-                    break;
+
+            int scanLimit = Math.min(allSlots.size(), 15);
+
+            //  Strategy 1: unique-class slot is the output 
+            // Count how many times each class appears in the first scanLimit slots
+            Map<Class<?>, Integer> classCounts = new LinkedHashMap<Class<?>, Integer>();
+            for (int i = 0; i < scanLimit; i++) {
+                Class<?> c = allSlots.get(i).getClass();
+                Integer n = classCounts.get(c);
+                classCounts.put(c, n == null ? 1 : n + 1);
+            }
+
+            // The output slot class appears exactly once; the input slot class
+            // appears 4 or 9 times (2x2 or 3x3 grid).
+            Class<?> outputClass = null;
+            Class<?> inputClass  = null;
+            for (Map.Entry<Class<?>, Integer> e : classCounts.entrySet()) {
+                if (e.getValue() == 1)               outputClass = e.getKey();
+                if (e.getValue() == 4 || e.getValue() == 9) inputClass  = e.getKey();
+            }
+
+            if (outputClass != null && inputClass != null) {
+                // Find the output slot index
+                int outputIdx = -1;
+                for (int i = 0; i < scanLimit; i++) {
+                    if (allSlots.get(i).getClass() == outputClass) { outputIdx = i; break; }
+                }
+                if (outputIdx >= 0) {
+                    List<Slot> inputs = new ArrayList<Slot>();
+                    for (int i = outputIdx + 1; i < allSlots.size(); i++) {
+                        if (allSlots.get(i).getClass() == inputClass) {
+                            inputs.add(allSlots.get(i));
+                            if (inputs.size() == 9) break;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (inputs.size() == 4 || inputs.size() == 9) {
+                        System.out.println("[XInputMod] findCraftingInputSlots: " + inputs.size()
+                            + " input slots via unique-class strategy"
+                            + " (output=" + outputClass.getSimpleName()
+                            + " input=" + inputClass.getSimpleName() + ")");
+                        return inputs;
+                    }
                 }
             }
-            if (outputIdx >= 0) {
-                List<Slot> inputs = new ArrayList<Slot>();
-                for (int i = outputIdx + 1; i < allSlots.size(); i++) {
-                    Slot s = allSlots.get(i);
-                    if (s.getClass() == Slot.class) {
-                        inputs.add(s);
-                        if (inputs.size() == 9) break;
-                    } else break;
+
+            //  Strategy 2: slots [1..4] or [1..9] all same class 
+            for (int gridSize : new int[]{9, 4}) {
+                if (allSlots.size() <= gridSize) continue;
+                Class<?> cls = allSlots.get(1).getClass();
+                boolean allSame = true;
+                for (int i = 2; i <= gridSize; i++) {
+                    if (allSlots.get(i).getClass() != cls) { allSame = false; break; }
                 }
-                if (inputs.size() == 4 || inputs.size() == 9) return inputs;
+                if (allSame) {
+                    List<Slot> inputs = new ArrayList<Slot>();
+                    for (int i = 1; i <= gridSize; i++) inputs.add(allSlots.get(i));
+                    System.out.println("[XInputMod] findCraftingInputSlots: " + inputs.size()
+                        + " input slots via positional fallback (class="
+                        + cls.getSimpleName() + ")");
+                    return inputs;
+                }
             }
-        } catch (Throwable t) {}
+
+            //  Log all slot classes so failures can be diagnosed 
+            System.out.println("[XInputMod] findCraftingInputSlots: no grid found. Slot classes:");
+            for (int i = 0; i < scanLimit; i++)
+                System.out.println("[XInputMod]   [" + i + "] "
+                    + allSlots.get(i).getClass().getSimpleName());
+
+        } catch (Throwable t) {
+            System.out.println("[XInputMod] findCraftingInputSlots failed: " + t);
+        }
         return null;
     }
 
@@ -615,9 +675,9 @@ public class RecipeBrowser {
         ItemStack[] ingredients = getShapedIngredients(recipe);
         int[] dims = getShapedDimensions(recipe);
         int recipeW = dims[0], recipeH = dims[1];
-        
+
         if (ingredients == null || recipeW <= 0 || recipeH <= 0 || recipeW > gridW || recipeH > gridW) return null;
-        
+
         ItemStack[] pattern = new ItemStack[gridW * gridW];
         int offsetX = (gridW - recipeW) / 2;
         int offsetY = (gridW - recipeH) / 2;
@@ -635,7 +695,8 @@ public class RecipeBrowser {
         List<ItemStack> ingredients = getShapelessIngredients(recipe);
         if (ingredients == null) return null;
         ItemStack[] pattern = new ItemStack[gridSize];
-        for (int i = 0; i < Math.min(ingredients.size(), gridSize); i++) pattern[i] = ingredients.get(i) == null ? null : ingredients.get(i).copy();
+        for (int i = 0; i < Math.min(ingredients.size(), gridSize); i++)
+            pattern[i] = ingredients.get(i) == null ? null : ingredients.get(i).copy();
         return pattern;
     }
 
@@ -644,15 +705,15 @@ public class RecipeBrowser {
             Object[] input = getShapedOrePatternObjects(recipe);
             int[] dims = getShapedOreDimensions(recipe);
             int recipeW = dims[0], recipeH = dims[1];
-            
+
             if (input == null || recipeW <= 0 || recipeH <= 0 || recipeW > gridW || recipeH > gridW) return null;
-            
+
             ItemStack[] resolved = new ItemStack[input.length];
             for (int i = 0; i < input.length; i++) {
                 ItemStack r = resolveOreIngredientPreferPlayer(input[i]);
                 resolved[i] = (r == null) ? null : r.copy();
             }
-            
+
             ItemStack[] pattern = new ItemStack[gridW * gridW];
             int offsetX = (gridW - recipeW) / 2;
             int offsetY = (gridW - recipeH) / 2;
