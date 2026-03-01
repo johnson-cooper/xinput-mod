@@ -10,6 +10,7 @@ import net.minecraft.client.gui.ScaledResolution;
 import net.minecraft.client.gui.inventory.GuiContainer;
 import net.minecraft.client.gui.inventory.GuiInventory;
 import net.minecraft.client.gui.GuiChat;
+import net.minecraft.client.gui.GuiControls;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.inventory.Slot;
 
@@ -18,12 +19,16 @@ import java.lang.reflect.Method;
 import java.util.EnumSet;
 import java.util.List;
 
+/**
+ * Tick handler driving controller polling + GUI interaction.
+ * Reworked to pull bindings from XInputMod.config via ControllerAction.
+ */
 public class XInputTickHandler implements ITickHandler {
 
     private final Minecraft mc = Minecraft.getMinecraft();
     private final XInputSharedState state;
 
-    //  Controller backends 
+    // Controller backends
     private final JInputController jinput = new JInputController();
     private boolean jinputPermanentlyFailed = false;
     private Object jxController = null;
@@ -32,35 +37,53 @@ public class XInputTickHandler implements ITickHandler {
 
     private final ControllerState cs = new ControllerState();
 
-    //  Recipe browser 
+    // Recipe browser
     final RecipeBrowser recipeBrowser = new RecipeBrowser(Minecraft.getMinecraft());
 
-    //  Tuning 
+    // Tuning
     private static final float MOVE_DEADZONE       = 0.25f;
     private static final float GUI_CURSOR_DEADZONE = 0.15f;
     private static final float GUI_CURSOR_SPEED    = 12.0f;
+    private static final float TRIGGER_THRESHOLD   = 0.45f; // analog trigger threshold
     private static final int   DEBUG_PRINT_EVERY   = 0;
 
-    //  Previous button states 
+    // Previous low-level button states (from controller)
     private boolean prevA, prevB, prevX, prevY;
     private boolean prevBack, prevStart, prevLB, prevRB;
     private boolean prevLThumb, prevRThumb;
     private boolean prevDpadUp, prevDpadDown, prevDpadLeft, prevDpadRight;
+    private float   prevLt = 0f, prevRt = 0f;
 
-    //  Drag state 
+    // Per-action previous states (so remaps work)
+    private final boolean[] prevActionPressed = new boolean[ControllerAction.values().length];
+
+    // Drag state
     private boolean isDragging = false;
     private long    aHeldSince = 0;
     private static final long DRAG_THRESHOLD_MS = 200;
 
-    //  Auto-craft state (Y hold) 
+    // Auto-craft state (Y hold)
     private long yCraftLastFired  = 0;
     private static final long CRAFT_INTERVAL_MS = 150;
 
-    //    Screen tracking (cursor re-centres when screen changes)               
+    // Screen tracking (cursor re-centres when screen changes)
     private GuiScreen lastScreen = null;
 
-    //  Misc 
-    private int debugCounter     = 0;
+    // Misc
+    private int debugCounter = 0;
+
+    // Controller settings button id (same as injector)
+    private static final int BTN_CONTROLLER = 9876;
+
+    // Sentinels for trigger bindings when user binds triggers explicitly.
+    // (We store these sentinel ints in the config if user binds a trigger;
+    // they are negative and won't collide with normal button indices.)
+    private static final int BIND_LT_SENTINEL = -100;
+    private static final int BIND_RT_SENTINEL = -101;
+    private static final int BIND_DPAD_UP    = -110;
+    private static final int BIND_DPAD_DOWN  = -111;
+    private static final int BIND_DPAD_LEFT  = -112;
+    private static final int BIND_DPAD_RIGHT = -113;
 
     public XInputTickHandler(XInputSharedState state) {
         this.state = state;
@@ -78,21 +101,38 @@ public class XInputTickHandler implements ITickHandler {
     @Override
     public void tickStart(EnumSet<TickType> types, Object... tickData) {
         if (!XInputMod.modEnabled) return;
+
+        // ensure GUI injector runs while Controls screen is open
+        GuiControlsInjector.tick(mc, XInputMod.config);
+
         boolean ok = pollController();
         if (!ok) {
             state.rawRx = 0f;
             state.rawRy = 0f;
+         // NEW: GUI Cursor uses Left Stick
+            state.rawLx = 0f; // Reset Left Stick
+            state.rawLy = 0f; // Reset Left Stick
             releaseMovementKeys();
+            // Clear previous action states so we don't get phantom edges
+            for (int i = 0; i < prevActionPressed.length; i++) prevActionPressed[i] = false;
             return;
         }
 
         state.rawRx = cs.rx;
         state.rawRy = cs.ry;
+        state.rawLx = cs.lx; // Add this line
+        state.rawLy = cs.ly; // Add this line
+
+        // Build per-action "currently pressed" snapshot (for remapping + edge detection)
+        boolean[] curActionPressed = new boolean[ControllerAction.values().length];
+        for (ControllerAction a : ControllerAction.values()) {
+            curActionPressed[a.ordinal()] = isActionPressed(a);
+        }
 
         boolean inGui = mc.currentScreen != null;
 
         if (inGui) {
-            handleGui();
+            handleGuiWithActionEdges(curActionPressed); // uses curActionPressed & prevActionPressed
             releaseMovementKeys();
         } else {
             state.cursorInitialised  = false;
@@ -100,7 +140,7 @@ public class XInputTickHandler implements ITickHandler {
             isDragging = false;
             lastScreen = null;
             recipeBrowser.close();
-            handleGameplay();
+            handleGameplayWithActionEdges(curActionPressed);
         }
 
         if (DEBUG_PRINT_EVERY > 0 && ++debugCounter >= DEBUG_PRINT_EVERY) {
@@ -109,29 +149,27 @@ public class XInputTickHandler implements ITickHandler {
                 cs.lx, cs.ly, cs.rx, cs.ry, cs.lt, cs.rt));
         }
 
+        // Update low-level prevs (keep these for compatibility & direct checks)
         prevA = cs.a; prevB = cs.b; prevX = cs.x; prevY = cs.y;
         prevLB = cs.lb; prevRB = cs.rb;
         prevBack = cs.back; prevStart = cs.start;
         prevLThumb = cs.lThumb; prevRThumb = cs.rThumb;
         prevDpadUp = cs.dpadUp; prevDpadDown = cs.dpadDown;
         prevDpadLeft = cs.dpadLeft; prevDpadRight = cs.dpadRight;
+
+        // Update trigger floats
+        prevLt = cs.lt; prevRt = cs.rt;
+
+        // Persist per-action previous states for next tick
+        for (int i = 0; i < prevActionPressed.length; i++) prevActionPressed[i] = curActionPressed[i];
     }
 
     // =========================================================================
-    // Controller polling — SDL2 primary, JXInput fallback (Windows only)
+    // Controller polling — JInput primary, JXInput fallback (Windows-only)
     // =========================================================================
 
-    /**
-     * Fills cs with the current controller state.
-     * Returns false if no controller is available.
-     *
-     * Priority:
-     *   1. JInput (bundled with Minecraft's LWJGL — works on Windows/macOS/Linux)
-     *   2. JXInput (Windows only fallback, used when JInput's environment is
-     *      broken by a bad HID device like ITE Device causing a RawInput NPE)
-     */
     private boolean pollController() {
-        //    Try JInput first                                                   
+        // Try JInput first
         if (!usingJXInput && !jinputPermanentlyFailed) {
             JInputController.InitResult result = jinput.init();
             if (result == JInputController.InitResult.OK) {
@@ -139,18 +177,12 @@ public class XInputTickHandler implements ITickHandler {
                 if (ok) return true;
                 // poll returned false = disconnected, will re-init next tick
             } else if (result == JInputController.InitResult.ENVIRONMENT_BROKEN) {
-                // JInput's environment failed. On Windows this used to mean the
-                // RawInput NPE was unrecoverable, but now JInputController tries
-                // DirectInputEnvironmentPlugin directly which avoids the NPE.
-                // If even that failed, permanently fall back to JXInput.
                 jinputPermanentlyFailed = true;
                 log("JInput environment broken, falling back to JXInput.");
             }
-            // InitResult.NO_CONTROLLER = environment ok but no gamepad found yet,
-            // keep retrying JInput in case controller is plugged in later.
         }
 
-        //    JInput unavailable — try JXInput (Windows only)                    
+        // JXInput fallback (Windows)
         if (!usingJXInput && !jxInitAttempted) {
             jxInitAttempted = true;
             jxController = initJXInput();
@@ -166,27 +198,21 @@ public class XInputTickHandler implements ITickHandler {
             return pollJXInput();
         }
 
-        // If JXInput also failed, keep retrying it periodically in case
-        // the controller gets plugged in later.
         if (usingJXInput && jxController == null) {
-            jxInitAttempted = false;
+            jxInitAttempted = false; // retry later
         }
 
         cs.zero();
         return false;
     }
 
-    //    JXInput via reflection                                                 
-    // All JXInput access goes through reflection so the mod compiles and loads
-    // on macOS/Linux where the JXInput classes aren't present at all.
-
+    // JXInput via reflection (unchanged)
     private Object initJXInput() {
         try {
             Class<?> devCls = Class.forName("com.github.strikerx3.jxinput.XInputDevice");
             Method isAvail = devCls.getMethod("isAvailable");
             if (!(Boolean) isAvail.invoke(null)) return null;
 
-            // Try getAllDevices first
             try {
                 Method getAll = devCls.getMethod("getAllDevices");
                 Object[] devices = (Object[]) getAll.invoke(null);
@@ -203,7 +229,6 @@ public class XInputTickHandler implements ITickHandler {
                 }
             } catch (Throwable ignored) {}
 
-            // Fall back to getDeviceFor(0..3)
             Method getFor = devCls.getMethod("getDeviceFor", int.class);
             for (int i = 0; i < 4; i++) {
                 try {
@@ -220,7 +245,7 @@ public class XInputTickHandler implements ITickHandler {
                 } catch (Throwable ignored) {}
             }
         } catch (ClassNotFoundException ignored) {
-            // JXInput not on classpath — expected on macOS/Linux
+            // expected on non-windows
         } catch (Throwable t) {
             log("JXInput init error: " + t);
         }
@@ -291,11 +316,24 @@ public class XInputTickHandler implements ITickHandler {
             return f.getFloat(axes);
         } catch (Throwable ignored) { return 0f; }
     }
+    private void toggleInventory() {
+        if (mc.thePlayer == null) return;
 
+        if (mc.currentScreen instanceof GuiInventory) {
+            // Close inventory
+            mc.thePlayer.closeScreen();
+            mc.setIngameFocus();
+        } else if (mc.currentScreen == null) {
+            // Open inventory
+            mc.displayGuiScreen(new GuiInventory(mc.thePlayer));
+        }
+    }
     // =========================================================================
-    // Gameplay
+    // Gameplay (uses action-based edges)
     // =========================================================================
-    private void handleGameplay() {
+
+    private void handleGameplayWithActionEdges(boolean[] curActionPressed) {
+        // Movement from left stick (unchanged)
         float procLx = processAxis(cs.lx, MOVE_DEADZONE);
         float procLy = processAxis(cs.ly, MOVE_DEADZONE);
 
@@ -304,54 +342,168 @@ public class XInputTickHandler implements ITickHandler {
         KeyBinding.setKeyBindState(mc.gameSettings.keyBindLeft.keyCode,     procLx < -0.001f);
         KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.keyCode,    procLx >  0.001f);
 
-        boolean ltPressed = cs.lt > 0.45f;
-        boolean rtPressed = cs.rt > 0.45f;
+        // Use item / attack / jump pulled from config bindings
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode,
+            curActionPressed[ControllerAction.USE_ITEM.ordinal()]);
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindAttack.keyCode,
+            curActionPressed[ControllerAction.ATTACK.ordinal()]);
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode,
+            curActionPressed[ControllerAction.JUMP.ordinal()]);
 
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, ltPressed);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindAttack.keyCode,  rtPressed);
-        if (rtPressed && mc.thePlayer != null) {
+        // Attack immediate actions (swing/attackEntity) on attack-press edge
+        boolean attackNow = curActionPressed[ControllerAction.ATTACK.ordinal()];
+        boolean attackPrev = prevActionPressed[ControllerAction.ATTACK.ordinal()];
+        if (attackNow && !attackPrev && mc.thePlayer != null) {
             mc.thePlayer.swingItem();
             if (mc.objectMouseOver != null && mc.objectMouseOver.entityHit != null)
                 mc.playerController.attackEntity(mc.thePlayer, mc.objectMouseOver.entityHit);
         }
 
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, cs.a);
-        if (cs.b && !prevB && mc.thePlayer != null) mc.thePlayer.dropOneItem(false);
-        if (cs.x && !prevX && mc.thePlayer != null)
-            mc.displayGuiScreen(new GuiInventory(mc.thePlayer));
+        // Drop item
+        if (curActionPressed[ControllerAction.DROP_ITEM.ordinal()] && !prevActionPressed[ControllerAction.DROP_ITEM.ordinal()]
+                && mc.thePlayer != null) {
+            mc.thePlayer.dropOneItem(false);
+        }
 
-        if (cs.lb && !prevLB && mc.thePlayer != null)
+     // Inventory toggle (open/close)
+        if (curActionPressed[ControllerAction.INVENTORY.ordinal()]
+            && !prevActionPressed[ControllerAction.INVENTORY.ordinal()]) {
+            toggleInventory();
+        }
+
+        // Hotbar cycle
+        if (curActionPressed[ControllerAction.HOTBAR_PREV.ordinal()] && !prevActionPressed[ControllerAction.HOTBAR_PREV.ordinal()]
+                && mc.thePlayer != null) {
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 8) % 9;
-        if (cs.rb && !prevRB && mc.thePlayer != null)
+        }
+        if (curActionPressed[ControllerAction.HOTBAR_NEXT.ordinal()] && !prevActionPressed[ControllerAction.HOTBAR_NEXT.ordinal()]
+                && mc.thePlayer != null) {
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 1) % 9;
+        }
 
-        if (cs.lThumb && !prevLThumb && mc.thePlayer != null)
+        // Sprint toggle (on LThumb press edge)
+        if (curActionPressed[ControllerAction.SPRINT.ordinal()] && !prevActionPressed[ControllerAction.SPRINT.ordinal()]
+                && mc.thePlayer != null) {
             mc.thePlayer.setSprinting(!mc.thePlayer.isSprinting());
-        // Hold sneak keybind while rThumb is held — setSneaking() alone doesn't
-        // sync crouch state to the server correctly in 1.4.7.
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSneak.keyCode, cs.rThumb);
+        }
 
-        if (cs.dpadUp   && !prevDpadUp)
+        // Hold sneak while SNEAK action active
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSneak.keyCode,
+            curActionPressed[ControllerAction.SNEAK.ordinal()]);
+
+        // D-pad actions (these are usually mapped separately in config to negative/other values;
+        // we also honor the default behaviour — third person / hide GUI)
+        if (curActionPressed[ControllerAction.THIRD_PERSON.ordinal()] && !prevActionPressed[ControllerAction.THIRD_PERSON.ordinal()]) {
             mc.gameSettings.thirdPersonView = (mc.gameSettings.thirdPersonView + 1) % 3;
-        if (cs.dpadDown && !prevDpadDown)
+        }
+        if (curActionPressed[ControllerAction.HIDE_HUD.ordinal()] && !prevActionPressed[ControllerAction.HIDE_HUD.ordinal()]) {
             mc.gameSettings.hideGUI = !mc.gameSettings.hideGUI;
+        }
 
-        if (cs.start && !prevStart) openPauseMenu();
-        if (cs.back  && !prevBack && mc.thePlayer != null)
+        // Pause / chat
+        if (curActionPressed[ControllerAction.PAUSE.ordinal()] && !prevActionPressed[ControllerAction.PAUSE.ordinal()]) openPauseMenu();
+        if (curActionPressed[ControllerAction.RECIPE_BROWSER.ordinal()] && !prevActionPressed[ControllerAction.RECIPE_BROWSER.ordinal()]
+                && mc.thePlayer != null) {
+            // Using RECIPE_BROWSER as "back" default - same as before
+            if (mc.currentScreen instanceof GuiContainer) {
+                if (recipeBrowser.isOpen) recipeBrowser.close(); else recipeBrowser.open();
+            } else {
+                closeGuiProperly(mc.currentScreen);
+            }
+        }
+        if (curActionPressed[ControllerAction.CHAT.ordinal()] && !prevActionPressed[ControllerAction.CHAT.ordinal()]) {
             mc.displayGuiScreen(new GuiChat());
+        }
 
+        // Detect Click on our custom button (using virtual cursor and A-equivalent action)
+        // We'll treat the JUMP action (default A) for clicks — but this is governed by config binding
+        boolean aPressedNow = curActionPressed[ControllerAction.JUMP.ordinal()];
+        boolean aPressedPrev = prevActionPressed[ControllerAction.JUMP.ordinal()];
+        if (aPressedNow && !aPressedPrev) { // On press edge
+            if (mc.currentScreen instanceof GuiControls) {
+                GuiControls gui = (GuiControls) mc.currentScreen;
+                List buttons = getButtonList(gui);
+                if (buttons != null) {
+                    for (Object obj : buttons) {
+                        if (!(obj instanceof GuiButton)) continue;
+                        GuiButton btn = (GuiButton) obj;
+                        if (btn.id == BTN_CONTROLLER && btn.mousePressed(mc, (int) state.cursorGuiX, (int) state.cursorGuiY)) {
+                            mc.sndManager.playSoundFX("random.click", 1.0F, 1.0F);
+                            mc.displayGuiScreen(new GuiControllerSettings(gui, XInputMod.config));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================
-    // GUI
+    // GUI handling (uses action-edge snapshot)
     // =========================================================================
-    private void handleGui() {
+
+    private void handleGuiWithActionEdges(boolean[] curActionPressed) {
         GuiScreen screen = mc.currentScreen;
 
+        // If we're on the Controller Settings screen and it's listening for a
+        // binding, forward the raw button (or trigger) as it is pressed.
+        if (screen instanceof GuiControllerSettings) {
+            GuiControllerSettings settingsGui = (GuiControllerSettings) screen;
+
+            // Standard face buttons -> send conventional indices (0..9)
+            if (cs.a && !prevA) { if (settingsGui.onControllerButton(0)) { /* consumed */ return; } }
+            if (cs.b && !prevB) { if (settingsGui.onControllerButton(1)) { return; } }
+            if (cs.x && !prevX) { if (settingsGui.onControllerButton(2)) { return; } }
+            if (cs.y && !prevY) { if (settingsGui.onControllerButton(3)) { return; } }
+
+            if (cs.lb && !prevLB) { if (settingsGui.onControllerButton(4)) { return; } }
+            if (cs.rb && !prevRB) { if (settingsGui.onControllerButton(5)) { return; } }
+
+            if (cs.lThumb && !prevLThumb) { if (settingsGui.onControllerButton(8)) { return; } }
+            if (cs.rThumb && !prevRThumb) { if (settingsGui.onControllerButton(9)) { return; } }
+
+            if (cs.back && !prevBack) { if (settingsGui.onControllerButton(6)) { return; } }
+            if (cs.start && !prevStart) { if (settingsGui.onControllerButton(7)) { return; } }
+
+            // Triggers: if pressed past threshold while previously below threshold,
+            // send sentinel so GUI can bind triggers specially.
+            if (cs.lt > TRIGGER_THRESHOLD && prevLt <= TRIGGER_THRESHOLD) {
+                if (settingsGui.onControllerButton(BIND_LT_SENTINEL)) return;
+            }
+            if (cs.rt > TRIGGER_THRESHOLD && prevRt <= TRIGGER_THRESHOLD) {
+                if (settingsGui.onControllerButton(BIND_RT_SENTINEL)) return;
+            }
+         // D-pad binding support
+            if (cs.dpadUp && !prevDpadUp) {
+                if (settingsGui.onControllerButton(BIND_DPAD_UP)) return;
+            }
+            if (cs.dpadDown && !prevDpadDown) {
+                if (settingsGui.onControllerButton(BIND_DPAD_DOWN)) return;
+            }
+            if (cs.dpadLeft && !prevDpadLeft) {
+                if (settingsGui.onControllerButton(BIND_DPAD_LEFT)) return;
+            }
+            if (cs.dpadRight && !prevDpadRight) {
+                if (settingsGui.onControllerButton(BIND_DPAD_RIGHT)) return;
+            }
+        }
+
+        // Normal GUI processing (cursor movement / clicks etc.)
+        handleGui(screen, curActionPressed);
+    }
+
+    // Keep core GUI behavior (cursor, clicks) in a separate method that
+    // receives current action pressed snapshot for uses that map to actions.
+    private void handleGui(GuiScreen screen, boolean[] curActionPressed) {
         ScaledResolution sr = getScaledResolution();
         int scaledW = sr.getScaledWidth();
         int scaledH = sr.getScaledHeight();
-
+     // Inventory toggle while GUI is open
+        if (curActionPressed[ControllerAction.INVENTORY.ordinal()]
+            && !prevActionPressed[ControllerAction.INVENTORY.ordinal()]) {
+            toggleInventory();
+            return;
+        }
         // Re-centre cursor whenever the active screen changes
         if (!state.cursorInitialised || screen != lastScreen) {
             state.cursorGuiX       = scaledW / 2f;
@@ -360,30 +512,27 @@ public class XInputTickHandler implements ITickHandler {
             lastScreen = screen;
         }
 
-        //    Back: toggle recipe browser (containers only) or close screen      
-        // Checked first so the toggle fires before any other input is processed.
-        if (cs.back && !prevBack) {
+        // Back: toggle recipe browser (containers only) or close screen
+        if (curActionPressed[ControllerAction.RECIPE_BROWSER.ordinal()] && !prevActionPressed[ControllerAction.RECIPE_BROWSER.ordinal()]) {
             if (screen instanceof GuiContainer) {
-                if (recipeBrowser.isOpen) recipeBrowser.close();
-                else                      recipeBrowser.open();
+                if (recipeBrowser.isOpen) recipeBrowser.close(); else recipeBrowser.open();
             } else {
                 closeGuiProperly(screen);
             }
         }
 
-        //    Recipe browser: consume all input while open                       
+        // Recipe browser: consume all input while open
         if (recipeBrowser.isOpen) {
-            if (cs.dpadUp   && !prevDpadUp)   recipeBrowser.scroll(-1);
-            if (cs.dpadDown && !prevDpadDown)  recipeBrowser.scroll( 1);
-            if (cs.a        && !prevA)         recipeBrowser.confirm();
-            if (cs.b        && !prevB)         recipeBrowser.close();
-            if (cs.x        && !prevX)         recipeBrowser.close();
-            if (cs.start    && !prevStart)     recipeBrowser.close();
-            // Do not process any other GUI input while browser is open
+            if (curActionPressed[ControllerAction.THIRD_PERSON.ordinal()] && !prevActionPressed[ControllerAction.THIRD_PERSON.ordinal()]) recipeBrowser.scroll(-1);
+            if (curActionPressed[ControllerAction.HIDE_HUD.ordinal()] && !prevActionPressed[ControllerAction.HIDE_HUD.ordinal()]) recipeBrowser.scroll(1);
+            if (curActionPressed[ControllerAction.JUMP.ordinal()] && !prevActionPressed[ControllerAction.JUMP.ordinal()]) recipeBrowser.confirm();
+            if (curActionPressed[ControllerAction.DROP_ITEM.ordinal()] && !prevActionPressed[ControllerAction.DROP_ITEM.ordinal()]) recipeBrowser.close();
+            if (curActionPressed[ControllerAction.INVENTORY.ordinal()] && !prevActionPressed[ControllerAction.INVENTORY.ordinal()]) recipeBrowser.close();
+            if (curActionPressed[ControllerAction.PAUSE.ordinal()] && !prevActionPressed[ControllerAction.PAUSE.ordinal()]) recipeBrowser.close();
             return;
         }
 
-        //    Left stick: free analog cursor movement                            
+        // Left stick: free analog cursor movement
         float rsX = processAxis(cs.lx, GUI_CURSOR_DEADZONE);
         float rsY = processAxis(cs.ly, GUI_CURSOR_DEADZONE);
 
@@ -394,8 +543,8 @@ public class XInputTickHandler implements ITickHandler {
             state.cursorGuiY = clamp(state.cursorGuiY + -rsY * GUI_CURSOR_SPEED, 0, scaledH - 1);
         }
 
-        //    D-pad: hotbar cycling in all GUI screens                           
-        if (cs.dpadLeft  && !prevDpadLeft  && mc.thePlayer != null)
+        // D-pad hotbar cycling in GUIs (still handy)
+        if (cs.dpadLeft && !prevDpadLeft && mc.thePlayer != null)
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 8) % 9;
         if (cs.dpadRight && !prevDpadRight && mc.thePlayer != null)
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 1) % 9;
@@ -403,43 +552,111 @@ public class XInputTickHandler implements ITickHandler {
         int mouseX = (int) state.cursorGuiX;
         int mouseY = (int) state.cursorGuiY;
 
-        //    A: click / drag                                                    
-        if (cs.a && !prevA) {
+        // A: click / drag (we use ACTION JUMP by default)
+        boolean aNow = curActionPressed[ControllerAction.JUMP.ordinal()];
+        boolean aPrev = prevActionPressed[ControllerAction.JUMP.ordinal()];
+        if (aNow && !aPrev) {
             aHeldSince = System.currentTimeMillis();
             isDragging = false;
             simulateMouseClick(screen, mouseX, mouseY, 0);
-        } else if (cs.a && prevA) {
+        } else if (aNow && aPrev) {
             if (System.currentTimeMillis() - aHeldSince > DRAG_THRESHOLD_MS) {
                 isDragging = true;
                 simulateMouseDrag(screen, mouseX, mouseY, 0);
             }
-        } else if (!cs.a && prevA) {
+        } else if (!aNow && aPrev) {
             if (isDragging) simulateMouseRelease(screen, mouseX, mouseY, 0);
             isDragging = false;
         }
 
-        //    B: right-click                                                     
-        if (cs.b && !prevB) simulateMouseClick(screen, mouseX, mouseY, 1);
+        // B: right-click (mapped to DROP_ITEM action by default)
+        if (curActionPressed[ControllerAction.DROP_ITEM.ordinal()] && !prevActionPressed[ControllerAction.DROP_ITEM.ordinal()])
+            simulateMouseClick(screen, mouseX, mouseY, 1);
 
-        //    Y: shift-click                                                     
-        if (cs.y && !prevY && screen instanceof GuiContainer)
+        // Y: shift-click (we map INVENTORY/shift-click behavior to INVENTORY action)
+        if (curActionPressed[ControllerAction.INVENTORY.ordinal()] && !prevActionPressed[ControllerAction.INVENTORY.ordinal()] && screen instanceof GuiContainer)
             shiftClickSlotAt((GuiContainer) screen, mouseX, mouseY);
 
-        //    X: close screen                                                   
-        if (cs.x && !prevX)
+        // X: close screen (mapped to PAUSE or custom)
+        if (curActionPressed[ControllerAction.PAUSE.ordinal()] && !prevActionPressed[ControllerAction.PAUSE.ordinal()])
             closeGuiProperly(screen);
 
-        //    Start: close in-game GUIs; do nothing on title screen (no player)    
-        if (cs.start && !prevStart && mc.thePlayer != null)
+        // Start: close in-game GUIs; do nothing on title screen (no player)
+        if (curActionPressed[ControllerAction.RECIPE_BROWSER.ordinal()] && !prevActionPressed[ControllerAction.RECIPE_BROWSER.ordinal()] && mc.thePlayer != null)
             closeGuiProperly(screen);
 
-        //    LB/RB: scroll                                                      
+        // LB/RB: scroll
         if (cs.lb && !prevLB) simulateScroll(screen, mouseX, mouseY,  1);
         if (cs.rb && !prevRB) simulateScroll(screen, mouseX, mouseY, -1);
     }
 
     // =========================================================================
-    // Helpers
+    // Action -> controller mapping helpers
+    // =========================================================================
+
+    /**
+     * Returns true if the given logical ControllerAction is currently active
+     * according to the binding in config and the current controller state.
+     *
+     * Defaults:
+     *  - ATTACK -> RT analog if binding is negative/unset
+     *  - USE_ITEM -> LT analog if binding is negative/unset
+     *
+     * If user binds the action to a numeric button index, we map common indices:
+     *   0=A,1=B,2=X,3=Y,4=LB,5=RB,6=Back,7=Start,8=LStick,9=RStick
+     *
+     * If the user explicitly binds to the sentinel values BIND_LT_SENTINEL/BIND_RT_SENTINEL
+     * (when GUI supplies them), those map to analog triggers as well.
+     */
+    private boolean isActionPressed(ControllerAction action) {
+        if (XInputMod.config == null) return false;
+        int binding = XInputMod.config.getBinding(action);
+     // D-pad sentinels
+        if (binding == BIND_DPAD_UP)    return cs.dpadUp;
+        if (binding == BIND_DPAD_DOWN)  return cs.dpadDown;
+        if (binding == BIND_DPAD_LEFT)  return cs.dpadLeft;
+        if (binding == BIND_DPAD_RIGHT) return cs.dpadRight;
+        if (binding < 0) {
+            if (action == ControllerAction.HOTBAR_PREV) return cs.dpadLeft;
+            if (action == ControllerAction.HOTBAR_NEXT) return cs.dpadRight;
+            if (action == ControllerAction.THIRD_PERSON) return cs.dpadUp;
+            if (action == ControllerAction.HIDE_HUD) return cs.dpadDown;
+        }
+        // Explicit trigger sentinels
+        if (binding == BIND_LT_SENTINEL) return cs.lt > TRIGGER_THRESHOLD;
+        if (binding == BIND_RT_SENTINEL) return cs.rt > TRIGGER_THRESHOLD;
+
+        // Legacy defaults: ATTACK/USE_ITEM use triggers if unbound (-1)
+        if (binding < 0) {
+            if (action == ControllerAction.ATTACK) return cs.rt > TRIGGER_THRESHOLD;
+            if (action == ControllerAction.USE_ITEM) return cs.lt > TRIGGER_THRESHOLD;
+            // otherwise unbound / false
+            return false;
+        }
+
+        // Numeric button mapping (best-effort)
+        switch (binding) {
+            case 0: return cs.a;
+            case 1: return cs.b;
+            case 2: return cs.x;
+            case 3: return cs.y;
+            case 4: return cs.lb;
+            case 5: return cs.rb;
+            case 6: return cs.back;
+            case 7: return cs.start;
+            case 8: return cs.lThumb;
+            case 9: return cs.rThumb;
+            default:
+                // If JInput reports more buttons and user bound one >9, we try
+                // to detect it by comparing raw indices in JInput (best-effort).
+                // However JInputController currently doesn't expose raw button read
+                // externally; in practice the common buttons above cover most cases.
+                return false;
+        }
+    }
+
+    // =========================================================================
+    // Helpers (existing code, mostly unchanged)
     // =========================================================================
 
     private static float processAxis(float v, float dz) {
@@ -479,14 +696,6 @@ public class XInputTickHandler implements ITickHandler {
     // Reflection helpers — obfuscation-safe (look up by signature, not name)
     // =========================================================================
 
-    /**
-     * Cache for mouse-event methods on GuiScreen, resolved by type signature
-     * rather than name so they survive reobfuscation.
-     */
-    // All (int,int,int) void methods on GuiScreen — both mouseClicked and
-    // mouseMovedOrUp share this signature. After obfuscation we cannot tell
-    // them apart by name, so we call ALL of them on press. mouseMovedOrUp
-    // called on press is harmless; missing mouseClicked means no response.
     private final List<Method> cachedTripleIntMethods = new java.util.ArrayList<Method>();
     private Method cachedMouseDrag    = null;
     private Method cachedActionPerf   = null;
@@ -619,12 +828,6 @@ public class XInputTickHandler implements ITickHandler {
     // Cached slot-lookup method (obfuscation-safe, resolved by signature)
     private Method cachedSlotMethod = null;
 
-    /**
-     * Find the slot under (mouseX, mouseY) in scaled GUI coords.
-     * Returns null if no slot is there or lookup fails.
-     * Uses the same (int,int)->Slot signature search as before, but extracted
-     * so both shiftClickSlotAt and the auto-craft hold check can use it.
-     */
     private Slot getSlotAt(GuiContainer gui, int mouseX, int mouseY) {
         try {
             if (cachedSlotMethod == null) {
@@ -669,13 +872,10 @@ public class XInputTickHandler implements ITickHandler {
         if (screen instanceof GuiContainer && mc.thePlayer != null) {
             mc.thePlayer.closeScreen();
         } else if (mc.thePlayer != null) {
-            // In-game non-container screen (chat, pause menu, etc.)
             try { screen.onGuiClosed(); } catch (Throwable ignored) {}
             mc.displayGuiScreen(null);
             mc.setIngameFocus();
         }
-        // If thePlayer is null (title screen) we don't try to close anything —
-        // the title screen manages its own lifecycle.
     }
 
     private void openPauseMenu() {
@@ -686,5 +886,14 @@ public class XInputTickHandler implements ITickHandler {
             log("Could not open pause menu: " + t.getMessage());
             mc.displayGuiScreen(null);
         }
+    }
+
+    // Reflection helper to get button list from a GuiControls instance (best-effort)
+    private List getButtonList(Object gui) {
+        try {
+            Field f = gui.getClass().getSuperclass().getDeclaredField("buttonList");
+            f.setAccessible(true);
+            return (List) f.get(gui);
+        } catch (Exception e) { return null; }
     }
 }

@@ -7,6 +7,8 @@ public class XInputSharedState {
 
     public float rawRx = 0f;
     public float rawRy = 0f;
+    public float rawLx = 0f;
+    public float rawLy = 0f;
 
 
     public float  cursorGuiX       = 0f;
