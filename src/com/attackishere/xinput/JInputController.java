@@ -41,8 +41,13 @@ public class JInputController {
 
     private boolean initialised = false;
 
+    // Set DEBUG_BUTTONS = true to log every button press once (helps identify unknown controllers).
+    // Set back to false after mapping is confirmed.
+    private static final boolean DEBUG_BUTTONS = true;
+    private final boolean[] debugLoggedButton = new boolean[64]; // log each index once
+
     // =========================================================================
-    // Public accessors  return the detected JInput button index for each
+    // Public accessors   return the detected JInput button index for each
     // logical button. Used by XInputTickHandler when forwarding button presses
     // to the controller settings GUI so bindings store the correct index.
     // =========================================================================
@@ -249,55 +254,164 @@ public class JInputController {
             System.out.println("[XInputMod] Default button map: Xbox 360 standard (10 btn)");
         }
 
-        // Name-based detection for Start/Back/LStick/RStick (as before)
-        int foundStart = -1, foundBack = -1, foundLStick = -1, foundRStick = -1;
+        //    Name-based button detection                                          
+        // Covers every known naming convention across Xbox, PlayStation, Nintendo,
+        // and generic HID drivers. Many controllers (including Xbox Wireless on Mac
+        // via JInput) report no names at all   that case is handled by the
+        // count-based fallback above; this pass upgrades it when names ARE present.
+
+        int foundStart  = -1; // Start / Menu / Options / Plus / Mode / Guide
+        int foundBack   = -1; // Back  / Select / View / Share / Capture / Minus / Create
+        int foundLStick = -1; // L3 / LS / Left Thumb / Left Stick
+        int foundRStick = -1; // R3 / RS / Right Thumb / Right Stick
+        int foundLB     = -1; // LB / L1 / Left Bumper / Left Shoulder
+        int foundRB     = -1; // RB / R1 / Right Bumper / Right Shoulder
+
         for (int i = 0; i < buttons.length; i++) {
             Component b = buttons[i];
             if (b == null) continue;
-            String name = b.getName();
-            if (name == null) name = "";
-            String n = name.toLowerCase();
+            String raw  = b.getName();
+            if (raw == null) raw = b.getIdentifier() != null ? b.getIdentifier().toString() : "";
+            String n = raw.toLowerCase().trim();
+            if (n.isEmpty()) continue;
 
-            if (foundStart == -1 && (n.contains("start") || n.contains("menu") || n.contains("options")
-                    || n.contains("guide") || n.contains("pause") || n.contains("mode"))) {
-                foundStart = i;
+            //    Start / Menu equivalents                                   
+            // Xbox: "start" | Xbox One/S/X/Series: "menu" | PS: "options" | PS3: "start"
+            // Switch: "plus" | Generic: "mode" "guide" "home" "pause" "system"
+            if (foundStart == -1) {
+                if (n.equals("start") || n.equals("menu") || n.equals("options")
+                    || n.equals("plus") || n.equals("guide") || n.equals("home")
+                    || n.equals("mode") || n.equals("system") || n.equals("pause")
+                    || n.contains("start") || n.contains("menu") || n.contains("options")
+                    || n.contains("guide") || n.contains("plus btn") || n.contains("plus button")) {
+                    foundStart = i;
+                }
             }
-            if (foundBack == -1 && (n.contains("back") || n.contains("select") || n.contains("view"))) {
-                foundBack = i;
+
+            //    Back / Select / Share equivalents                          
+            // Xbox 360: "back" | Xbox One/S/X: "view" | PS1-3: "select" | PS4/5: "share" "create"
+            // Switch: "minus" | Generic: "select" "capture" "screenshot"
+            if (foundBack == -1) {
+                if (n.equals("back") || n.equals("select") || n.equals("view")
+                    || n.equals("share") || n.equals("create") || n.equals("minus")
+                    || n.equals("capture") || n.equals("screenshot")
+                    || n.contains("back") || n.contains("select") || n.contains("view")
+                    || n.contains("share") || n.contains("create") || n.contains("minus btn")
+                    || n.contains("capture") || n.contains("screenshot")) {
+                    foundBack = i;
+                }
             }
-            if (foundLStick == -1 && (n.contains("lstick") || n.contains("left stick") || n.contains("left thumb")
-                    || n.contains("l thumb") || (n.contains("stick") && n.contains("left")))) {
-                foundLStick = i;
+
+            //    Left stick click                                           
+            // Xbox: "left thumb" | PS: "l3" | Generic: "lstick" "left stick" "l thumb"
+            if (foundLStick == -1) {
+                if (n.equals("l3") || n.equals("ls")
+                    || n.contains("lstick") || n.contains("left stick") || n.contains("left thumb")
+                    || n.contains("l thumb") || n.contains("l3") || n.contains("lthumb")
+                    || (n.contains("stick") && n.contains("left"))
+                    || (n.contains("thumb") && n.contains("left"))) {
+                    foundLStick = i;
+                }
             }
-            if (foundRStick == -1 && (n.contains("rstick") || n.contains("right stick") || n.contains("right thumb")
-                    || n.contains("r thumb") || (n.contains("stick") && n.contains("right")))) {
-                foundRStick = i;
+
+            //    Right stick click                                          
+            // Xbox: "right thumb" | PS: "r3" | Generic: "rstick" "right stick" "r thumb"
+            if (foundRStick == -1) {
+                if (n.equals("r3") || n.equals("rs")
+                    || n.contains("rstick") || n.contains("right stick") || n.contains("right thumb")
+                    || n.contains("r thumb") || n.contains("r3") || n.contains("rthumb")
+                    || (n.contains("stick") && n.contains("right"))
+                    || (n.contains("thumb") && n.contains("right"))) {
+                    foundRStick = i;
+                }
+            }
+
+            //    Left bumper / shoulder                                     
+            // Xbox: "left shoulder" | PS: "l1" | Generic: "lb" "l1" "leftshoulder"
+            if (foundLB == -1) {
+                if (n.equals("l1") || n.equals("lb")
+                    || n.contains("l1") || n.contains("lb")
+                    || n.contains("left shoulder") || n.contains("leftshoulder")
+                    || n.contains("left bumper") || n.contains("leftbumper")) {
+                    foundLB = i;
+                }
+            }
+
+            //    Right bumper / shoulder                                    
+            // Xbox: "right shoulder" | PS: "r1" | Generic: "rb" "r1" "rightshoulder"
+            if (foundRB == -1) {
+                if (n.equals("r1") || n.equals("rb")
+                    || n.contains("r1") || n.contains("rb")
+                    || n.contains("right shoulder") || n.contains("rightshoulder")
+                    || n.contains("right bumper") || n.contains("rightbumper")) {
+                    foundRB = i;
+                }
             }
         }
 
-        if (foundStart >= 0 && foundStart < buttons.length) {
-            if (foundStart != btnA && foundStart != btnB && foundStart != btnX && foundStart != btnY) {
-                btnStart = foundStart;
-                System.out.println("[XInputMod] Detected Start button at index " + btnStart + " (name=\"" +
-                    safeButtonName(btnStart) + "\")");
-            }
+        // Apply detected indices   only override if not conflicting with face buttons
+        boolean[] faceIndices = new boolean[Math.max(buttons.length, 4)];
+        faceIndices[btnA] = true; faceIndices[btnB] = true;
+        faceIndices[btnX] = true; faceIndices[btnY] = true;
+
+        if (foundStart >= 0 && !faceIndices[foundStart]) {
+            btnStart = foundStart;
+
         }
-        if (foundBack >= 0 && foundBack < buttons.length) {
-            if (foundBack != btnA && foundBack != btnB && foundBack != btnX && foundBack != btnY) {
-                btnBack = foundBack;
-                System.out.println("[XInputMod] Detected Back/Select button at index " + btnBack + " (name=\"" +
-                    safeButtonName(btnBack) + "\")");
-            }
+        if (foundBack >= 0 && !faceIndices[foundBack]) {
+            btnBack = foundBack;
+
         }
-        if (foundLStick >= 0 && foundLStick < buttons.length) {
+        if (foundLStick >= 0) {
             btnLStick = foundLStick;
-            System.out.println("[XInputMod] Detected LStick button at index " + btnLStick + " (name=\"" +
-                safeButtonName(btnLStick) + "\")");
+
         }
-        if (foundRStick >= 0 && foundRStick < buttons.length) {
+        if (foundRStick >= 0) {
             btnRStick = foundRStick;
-            System.out.println("[XInputMod] Detected RStick button at index " + btnRStick + " (name=\"" +
-                safeButtonName(btnRStick) + "\")");
+
+        }
+        if (foundLB >= 0 && !faceIndices[foundLB]) {
+            btnLB = foundLB;
+
+        }
+        if (foundRB >= 0 && !faceIndices[foundRB]) {
+            btnRB = foundRB;
+
+        }
+
+        //    Identifier-based detection (fallback for drivers using id strings)   
+        // Some HID drivers set the Identifier string rather than the display name.
+        // We run this only for indices we haven't resolved yet.
+        if (foundStart == -1 || foundBack == -1 || foundLStick == -1 || foundRStick == -1) {
+            for (int i = 0; i < buttons.length; i++) {
+                Component b = buttons[i];
+                if (b == null || b.getIdentifier() == null) continue;
+                String id = b.getIdentifier().toString().toLowerCase();
+                if (foundStart == -1 && !faceIndices[i]
+                        && (id.contains("start") || id.contains("menu") || id.contains("options")
+                            || id.contains("guide") || id.contains("plus"))) {
+                    btnStart = i; foundStart = i;
+                    
+                }
+                if (foundBack == -1 && !faceIndices[i]
+                        && (id.contains("back") || id.contains("select") || id.contains("view")
+                            || id.contains("share") || id.contains("create") || id.contains("minus"))) {
+                    btnBack = i; foundBack = i;
+                    
+                }
+                if (foundLStick == -1
+                        && (id.contains("lstick") || id.contains("left stick") || id.contains("left thumb")
+                            || id.contains("l3") || (id.contains("thumb") && id.contains("left")))) {
+                    btnLStick = i; foundLStick = i;
+                    
+                }
+                if (foundRStick == -1
+                        && (id.contains("rstick") || id.contains("right stick") || id.contains("right thumb")
+                            || id.contains("r3") || (id.contains("thumb") && id.contains("right")))) {
+                    btnRStick = i; foundRStick = i;
+                    
+                }
+            }
         }
 
         // ------------------------
@@ -423,6 +537,16 @@ public class JInputController {
 
             // Read D-pad / POV (robust)
             readPOV(cs);
+
+            // Debug: log each button index the first time it is pressed
+            if (DEBUG_BUTTONS) {
+                for (int _i = 0; _i < buttons.length && _i < debugLoggedButton.length; _i++) {
+                    if (!debugLoggedButton[_i] && buttons[_i] != null && buttons[_i].getPollData() > 0.5f) {
+                        debugLoggedButton[_i] = true;
+                       
+                    }
+                }
+            }
 
             return true;
 
