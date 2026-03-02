@@ -7,6 +7,7 @@ import org.lwjgl.input.Mouse;
 import org.lwjgl.opengl.GL11;
 import net.minecraft.client.gui.ScaledResolution;
 import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.List;
 
 public class GuiControllerSettings extends GuiScreen {
@@ -18,171 +19,184 @@ public class GuiControllerSettings extends GuiScreen {
     private long listeningStart = 0;
     private static final long LISTEN_TIMEOUT_MS = 5000;
 
-    // Scrolling Logic
+    // Scrolling
     private int scrollOffset = 0;
-    private final int rowHeight = 24;
-    private final int viewTop = 130;    // Scroll list start
-    private final int viewBottom = 35; // Margin for Done button area
+    private final int rowHeight   = 24;
+    private final int viewTop     = 130;
+    private final int viewBottom  = 35;
 
-    private static final int BTN_DONE = 0;
-    private static final int BTN_TOGGLE = 1;
+    private static final int BTN_DONE      = 0;
+    private static final int BTN_TOGGLE    = 1;
     private static final int BTN_REMAP_BASE = 100;
 
     private int draggingSlider = -1;
+
+    // Cached button list field   resolved once, works in obfuscated jars
+    private Field cachedButtonListField = null;
+    private boolean buttonListFieldSearched = false;
 
     public GuiControllerSettings(GuiScreen parent, XInputConfig config) {
         this.parentScreen = parent;
         this.config = config;
     }
 
+    // =========================================================================
+    // Obfuscation-safe button list access
+    // =========================================================================
+
     /**
-     * SAFELY gets the button list using reflection to avoid the "cannot be resolved" error.
+     * Finds the button list field by:
+     * 1. Trying known MCP names ("buttonList", "controlList") up the hierarchy.
+     * 2. Scanning every field in the hierarchy for a List that holds GuiButtons.
+     *
+     * Result is cached so reflection only runs once per screen instance.
      */
     @SuppressWarnings("unchecked")
     private List<GuiButton> getInternalButtonList() {
-        try {
-            Field f;
-            try {
-                // Try standard MCP name
-                f = GuiScreen.class.getDeclaredField("buttonList");
-            } catch (NoSuchFieldException e) {
-                // Try common 1.4.7 alternative name
-                f = GuiScreen.class.getDeclaredField("controlList");
+        // Resolve the field once
+        if (!buttonListFieldSearched) {
+            buttonListFieldSearched = true;
+
+            // Pass 1   known MCP names
+            outer:
+            for (String name : new String[]{"buttonList", "controlList"}) {
+                Class<?> cur = getClass();
+                while (cur != null) {
+                    try {
+                        Field f = cur.getDeclaredField(name);
+                        f.setAccessible(true);
+                        cachedButtonListField = f;
+                        break outer;
+                    } catch (NoSuchFieldException ignored) {}
+                    cur = cur.getSuperclass();
+                }
             }
-            f.setAccessible(true);
-            return (List<GuiButton>) f.get(this);
-        } catch (Exception e) {
-            System.out.println("[XInput] Critical Error: Could not find button list field!");
-            return null;
+
+            // Pass 2   obfuscated fallback: first List field containing GuiButtons
+            if (cachedButtonListField == null) {
+                Class<?> cur = getClass();
+                while (cur != null && cachedButtonListField == null) {
+                    for (Field f : cur.getDeclaredFields()) {
+                        if (!List.class.isAssignableFrom(f.getType())) continue;
+                        f.setAccessible(true);
+                        try {
+                            Object val = f.get(this);
+                            if (val == null) continue;
+                            List<?> list = (List<?>) val;
+                            // Accept empty lists too   they'll be populated by initGui
+                            if (list.isEmpty() || list.get(0) instanceof GuiButton) {
+                                cachedButtonListField = f;
+                                System.out.println("[XInputMod] GuiControllerSettings: found button list field '"
+                                    + f.getName() + "' in " + cur.getSimpleName());
+                                break;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    cur = cur.getSuperclass();
+                }
+            }
+
+            if (cachedButtonListField == null) {
+                System.out.println("[XInputMod] GuiControllerSettings: FAILED to find button list field!");
+            }
         }
+
+        if (cachedButtonListField == null) return new ArrayList<GuiButton>(); // safe empty fallback
+        try {
+            Object val = cachedButtonListField.get(this);
+            if (val instanceof List) return (List<GuiButton>) val;
+        } catch (Throwable t) {
+            System.out.println("[XInputMod] getInternalButtonList get() failed: " + t);
+        }
+        return new ArrayList<GuiButton>();
     }
+
+    // =========================================================================
+    // GuiScreen lifecycle
+    // =========================================================================
 
     @Override
     public void initGui() {
         List<GuiButton> buttons = getInternalButtonList();
-        if (buttons == null) return;
-        
         buttons.clear();
 
-        int cx = width / 2;
+        int cx   = width / 2;
         int yDone = height - 28;
 
-        // Static header buttons
-        buttons.add(new GuiButton(BTN_DONE, cx - 75, yDone, 150, 20, "Done"));
-        buttons.add(new GuiButton(BTN_TOGGLE, cx - 155, 32, 150, 20, 
+        buttons.add(new GuiButton(BTN_DONE,   cx - 75,  yDone, 150, 20,
+            "Done"));
+        buttons.add(new GuiButton(BTN_TOGGLE, cx - 155, 32,   150, 20,
             "Controller: " + (config.enableController ? "ON" : "OFF")));
 
-        // Add remapping buttons (Positioned later in drawScreen)
         for (ControllerAction action : ControllerAction.values()) {
-            int id = BTN_REMAP_BASE + action.ordinal();
-            buttons.add(new GuiButton(id, cx + 5, 0, 145, 20, ""));
+            buttons.add(new GuiButton(BTN_REMAP_BASE + action.ordinal(), cx + 5, 0, 145, 20, ""));
         }
     }
 
-    
     @Override
     public void drawScreen(int mouseX, int mouseY, float partialTicks) {
         drawDefaultBackground();
         int cx = width / 2;
         List<GuiButton> buttons = getInternalButtonList();
 
-        // 1. Mouse Wheel Scrolling
+        // Mouse wheel scrolling
         int dWheel = Mouse.getDWheel();
-        if (dWheel != 0) {
-            scrollOffset -= (dWheel > 0) ? 20 : -20;
-        }
-        
-        // Dynamic Max Scroll Calculation
+        if (dWheel != 0) scrollOffset -= (dWheel > 0) ? 20 : -20;
+
         int listHeight = ControllerAction.values().length * rowHeight;
         int viewHeight = height - viewTop - viewBottom;
-        int maxScroll = Math.max(0, listHeight - viewHeight + 10); // +10 for padding
-        scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+        int maxScroll  = Math.max(0, listHeight - viewHeight + 10);
+        scrollOffset   = Math.max(0, Math.min(scrollOffset, maxScroll));
 
-        // 2. Draw Static Header & Sliders
+        // Static header
         drawCenteredString(fontRenderer, "Controller Settings", cx, 8, 0xFFFFFF);
         int sliderTop = 60;
-        drawSliderRow(cx, sliderTop, "Look Speed X", config.lookSpeedX, 1);
-        drawSliderRow(cx, sliderTop + rowHeight, "Look Speed Y", config.lookSpeedY, 2);
-        drawSliderRow(cx, sliderTop + rowHeight * 2, "Deadzone", config.deadzone / 0.5f, 3);
-        
+        drawSliderRow(cx, sliderTop,                "Look Speed X", config.lookSpeedX,        1);
+        drawSliderRow(cx, sliderTop + rowHeight,    "Look Speed Y", config.lookSpeedY,        2);
+        drawSliderRow(cx, sliderTop + rowHeight * 2,"Deadzone",     config.deadzone / 0.5f,   3);
 
-        // 3. SCISSOR CLIPPING
+        // Scissor clipping for scroll area
         ScaledResolution sr = new ScaledResolution(mc.gameSettings, mc.displayWidth, mc.displayHeight);
-        int factor = sr.getScaleFactor();
-        
-        // We calculate the Y from the bottom up for OpenGL
+        int factor   = sr.getScaleFactor();
         int scissorY = viewBottom * factor;
         int scissorH = (height - viewTop - viewBottom) * factor;
 
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
         GL11.glScissor(0, scissorY, mc.displayWidth, scissorH);
 
-        // 4. Draw Scrollable Area
-        if (buttons != null) {
-            for (GuiButton btn : buttons) {
-                if (btn.id >= BTN_REMAP_BASE) {
-                    ControllerAction action = ControllerAction.values()[btn.id - BTN_REMAP_BASE];
-                    int btnY = viewTop + (action.ordinal() * rowHeight) - scrollOffset;
-
-                    btn.yPosition = btnY;
-                    btn.displayString = remapLabel(action);
-                    
-                    // Visibility check: If any part of the button is in the window, draw it
-                    if (btnY + rowHeight > viewTop && btnY < height - viewBottom) {
-                        btn.drawButton = true;
-                        drawString(fontRenderer, action.displayName, cx - 155, btnY + 5, 0xFFFFFF);
-                        btn.drawButton(mc, mouseX, mouseY); 
-                    } else {
-                        btn.drawButton = false;
-                    }
-                }
+        // Scrollable remap rows
+        for (GuiButton btn : buttons) {
+            if (btn.id < BTN_REMAP_BASE) continue;
+            ControllerAction action = ControllerAction.values()[btn.id - BTN_REMAP_BASE];
+            int btnY = viewTop + (action.ordinal() * rowHeight) - scrollOffset;
+            btn.yPosition     = btnY;
+            btn.displayString = remapLabel(action);
+            if (btnY + rowHeight > viewTop && btnY < height - viewBottom) {
+                btn.drawButton = true;
+                drawString(fontRenderer, action.displayName, cx - 155, btnY + 5, 0xFFFFFF);
+                btn.drawButton(mc, mouseX, mouseY);
+            } else {
+                btn.drawButton = false;
             }
         }
 
         GL11.glDisable(GL11.GL_SCISSOR_TEST);
 
-        // 5. Draw Footer (Done & Toggle)
+        // Footer (Done + Toggle   always visible)
         for (GuiButton btn : buttons) {
-            if (btn.id < BTN_REMAP_BASE) {
-                btn.drawButton(mc, mouseX, mouseY);
-            }
+            if (btn.id < BTN_REMAP_BASE) btn.drawButton(mc, mouseX, mouseY);
         }
 
-        if (listeningAction != null && System.currentTimeMillis() - listeningStart >= LISTEN_TIMEOUT_MS) {
+        // Listening timeout
+        if (listeningAction != null
+                && System.currentTimeMillis() - listeningStart >= LISTEN_TIMEOUT_MS) {
             listeningAction = null;
         }
     }
 
-    /**
-     * Call this from your Controller Input Loop to handle scrolling
-     * @param direction -1 for up, 1 for down
-     */
-    public void scrollWithController(int direction) {
-        this.scrollOffset += (direction * 20);
-    }
-
-    private void drawSliderRow(int cx, int y, String title, float val, int id) {
-        drawString(fontRenderer, title, cx - 155, y, 0xAAAAAA);
-        drawSlider(cx - 155, y + 10, 150, val, id);
-    }
-
-    private void drawSlider(int x, int y, int w, float value, int sliderId) {
-        drawRect(x, y + 3, x + w, y + 7, 0xFF555555);
-        int fillW = (int)(value * w);
-        drawRect(x, y + 3, x + fillW, y + 7, 0xFF44AA44);
-        int hx = x + fillW - 3;
-        drawRect(hx, y, hx + 6, y + 10, 0xFFFFFFFF);
-        
-        String label = (sliderId == 3) ? String.format("%.2f", config.deadzone) : 
-                       String.format("%.1f", (sliderId == 1 ? config.lookSpeedX : config.lookSpeedY) * 20f);
-        drawString(fontRenderer, label, x + w + 4, y + 1, 0xCCCCCC);
-    }
-
-    private String remapLabel(ControllerAction action) {
-        if (listeningAction == action) return "> Listening... <";
-        int bound = config.getBinding(action);
-        return bound < 0 ? "[ unbound ]" : "Button " + bound;
-    }
+    // =========================================================================
+    // Input
+    // =========================================================================
 
     @Override
     protected void actionPerformed(GuiButton button) {
@@ -194,16 +208,21 @@ public class GuiControllerSettings extends GuiScreen {
             button.displayString = "Controller: " + (config.enableController ? "ON" : "OFF");
         } else if (button.id >= BTN_REMAP_BASE) {
             listeningAction = ControllerAction.values()[button.id - BTN_REMAP_BASE];
-            listeningStart = System.currentTimeMillis();
+            listeningStart  = System.currentTimeMillis();
         }
     }
 
+    /** Called by XInputTickHandler when a controller button is pressed during listening mode. */
     public boolean onControllerButton(int buttonIndex) {
         if (listeningAction == null) return false;
         config.setBinding(listeningAction, buttonIndex);
         config.save();
         listeningAction = null;
         return true;
+    }
+
+    public void scrollWithController(int direction) {
+        scrollOffset += direction * 20;
     }
 
     @Override
@@ -220,20 +239,55 @@ public class GuiControllerSettings extends GuiScreen {
         super.mouseMovedOrUp(mouseX, mouseY, which);
     }
 
+    // =========================================================================
+    // Slider helpers
+    // =========================================================================
+
+    private void drawSliderRow(int cx, int y, String title, float val, int id) {
+        drawString(fontRenderer, title, cx - 155, y, 0xAAAAAA);
+        drawSlider(cx - 155, y + 10, 150, val, id);
+    }
+
+    private void drawSlider(int x, int y, int w, float value, int sliderId) {
+        drawRect(x, y + 3, x + w, y + 7, 0xFF555555);
+        int fillW = (int)(value * w);
+        drawRect(x, y + 3, x + fillW, y + 7, 0xFF44AA44);
+        int hx = x + fillW - 3;
+        drawRect(hx, y, hx + 6, y + 10, 0xFFFFFFFF);
+        String label = sliderId == 3
+            ? String.format("%.2f", config.deadzone)
+            : String.format("%.1f", (sliderId == 1 ? config.lookSpeedX : config.lookSpeedY) * 20f);
+        drawString(fontRenderer, label, x + w + 4, y + 1, 0xCCCCCC);
+    }
+
     private int hitSlider(int mx, int my, int sliderTop) {
         int x = width / 2 - 155;
         if (mx < x || mx > x + 150) return -1;
-        if (my >= sliderTop + 10 && my <= sliderTop + 20) return 1;
+        if (my >= sliderTop + 10            && my <= sliderTop + 20)            return 1;
         if (my >= sliderTop + rowHeight + 10 && my <= sliderTop + rowHeight + 20) return 2;
-        if (my >= sliderTop + rowHeight * 2 + 10 && my <= sliderTop + rowHeight * 2 + 20) return 3;
+        if (my >= sliderTop + rowHeight*2+10 && my <= sliderTop + rowHeight*2+20) return 3;
         return -1;
     }
 
     private void updateSlider(int id, int mouseX, int sliderTop) {
         float t = Math.max(0f, Math.min(1f, (mouseX - (width / 2 - 155)) / 150f));
-        if (id == 1) config.lookSpeedX = t;
+        if      (id == 1) config.lookSpeedX = t;
         else if (id == 2) config.lookSpeedY = t;
-        else if (id == 3) config.deadzone = t * 0.5f;
+        else if (id == 3) config.deadzone   = t * 0.5f;
+    }
+
+    private String remapLabel(ControllerAction action) {
+        if (listeningAction == action) return "> Press a button... <";
+        int bound = config.getBinding(action);
+        // Friendly names for sentinel bindings
+        if (bound == XInputTickHandler.BIND_LT_SENTINEL)  return "LT (Trigger)";
+        if (bound == XInputTickHandler.BIND_RT_SENTINEL)  return "RT (Trigger)";
+        if (bound == XInputTickHandler.BIND_DPAD_UP)      return "DPad Up";
+        if (bound == XInputTickHandler.BIND_DPAD_DOWN)    return "DPad Down";
+        if (bound == XInputTickHandler.BIND_DPAD_LEFT)    return "DPad Left";
+        if (bound == XInputTickHandler.BIND_DPAD_RIGHT)   return "DPad Right";
+        if (bound < 0) return "[ default ]";
+        return "Button " + bound;
     }
 
     @Override

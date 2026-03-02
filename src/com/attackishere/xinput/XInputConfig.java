@@ -1,48 +1,47 @@
 package com.attackishere.xinput;
 
 import net.minecraftforge.common.Configuration;
-
 import java.io.File;
 
-/**
- * Holds all configurable values for the controller mod.
- * Reads from and writes to the Forge config file.
- *
- * Default button bindings match the Xbox 360 standard layout (10-button):
- *   A=0 B=1 X=2 Y=3 LB=4 RB=5 Back=6 Start=7 LStick=8 RStick=9
- */
 public class XInputConfig {
 
-    private static final String CAT = "general";
+    private static final String CAT          = "general";
     private static final String CAT_BINDINGS = "bindings";
+
+    public static final int UNDETECTED = -99;
 
     private final Configuration forge;
 
-    //  Settings
     public boolean enableController = true;
-    public float   lookSpeedX  = 0.5f;   // 0..1 (displayed as 0..20)
+    public float   lookSpeedX  = 0.5f;
     public float   lookSpeedY  = 0.5f;
-    public float   deadzone    = 0.25f;  // 0..0.5
+    public float   deadzone    = 0.25f;
 
-    //  Button bindings
-    // Index = ControllerAction.ordinal(), value = JInput button index (-1 = unbound)
     private final int[] bindings = new int[ControllerAction.values().length];
 
-    private static final int[] DEFAULTS = new int[]{
-        /* JUMP          */ 0,   // A
-        /* ATTACK        */ -1,  // RT (analog, not a button in 10-btn layout)
-        /* USE_ITEM      */ -1,  // LT (analog)
-        /* SNEAK         */ 9,   // RStick
-        /* SPRINT        */ 8,   // LStick
-        /* INVENTORY     */ 2,   // X
-        /* DROP_ITEM     */ 1,   // B
-        /* HOTBAR_PREV   */ 4,   // LB
-        /* HOTBAR_NEXT   */ 5,   // RB
-        /* RECIPE_BROWSER*/ 6,   // Back
-        /* PAUSE         */ 7,   // Start
-        /* CHAT          */ 6,   // Back (same as recipe browser context-sensitive)
-        /* THIRD_PERSON  */ -1,  // dpad up (handled separately, no button index)
-        /* HIDE_HUD      */ -1,  // dpad down
+    // Fallback defaults  must stay aligned with ControllerAction ordinals.
+    // -1 means "use hardware default" (handled in isActionPressed switch).
+    // Sentinels from XInputTickHandler are used for dpad/trigger bindings.
+    //
+    // New default layout (matches this controller's ZRZ_RSTICK + 15-button map):
+    //   Sneak  = dpad down   (sentinel BIND_DPAD_DOWN = -111)
+    //   Sprint = dpad up     (sentinel BIND_DPAD_UP   = -110)
+    //   Hotbar = dpad left/right (-1 = hardware default = cs.dpadLeft/Right)
+    private static final int[] FALLBACK_DEFAULTS = new int[]{
+        /* JUMP           */  0,    // A
+        /* ATTACK         */ -1,    // RT (hardware default)
+        /* USE_ITEM       */ -1,    // LT (hardware default)
+        /* SNEAK          */ -111,  // dpad down (BIND_DPAD_DOWN)
+        /* SPRINT         */ -110,  // dpad up   (BIND_DPAD_UP)
+        /* INVENTORY      */  3,    // Y
+        /* DROP_ITEM      */  1,    // B
+        /* HOTBAR_PREV    */ -1,    // dpad left (hardware default)
+        /* HOTBAR_NEXT    */ -1,    // dpad right (hardware default)
+        /* RECIPE_BROWSER */  8,    // Back (wireless index)
+        /* PAUSE          */  9,    // Start (wireless index)
+        /* CHAT           */  8,    // Back
+        /* THIRD_PERSON   */ -1,    // unbound (was dpad up, now taken by sprint)
+        /* HIDE_HUD       */ -1,    // unbound
     };
 
     public XInputConfig(File configFile) {
@@ -52,51 +51,84 @@ public class XInputConfig {
 
     public void load() {
         forge.load();
-
         enableController = forge.get(CAT, "EnableController", true).getBoolean(true);
-        lookSpeedX  = (float) forge.get(CAT, "LookSpeedX",  0.5).getDouble(0.5);
-        lookSpeedY  = (float) forge.get(CAT, "LookSpeedY",  0.5).getDouble(0.5);
-        deadzone    = (float) forge.get(CAT, "Deadzone",   0.25).getDouble(0.25);
+        lookSpeedX = (float) forge.get(CAT, "LookSpeedX",  0.5).getDouble(0.5);
+        lookSpeedY = (float) forge.get(CAT, "LookSpeedY",  0.5).getDouble(0.5);
+        deadzone   = (float) forge.get(CAT, "Deadzone",   0.25).getDouble(0.25);
 
         for (ControllerAction action : ControllerAction.values()) {
-            int def = action.ordinal() < DEFAULTS.length ? DEFAULTS[action.ordinal()] : -1;
-            bindings[action.ordinal()] = forge.get(CAT_BINDINGS,
-                action.name(), def).getInt(def);
+            int fallback = fallbackFor(action);
+            int saved = forge.get(CAT_BINDINGS, action.name(), UNDETECTED).getInt(UNDETECTED);
+            bindings[action.ordinal()] = (saved == UNDETECTED) ? fallback : saved;
         }
-
-        // Older Forge mappings may not have hasChanged(), so always save to ensure file is updated.
         try { forge.save(); } catch (Throwable ignored) {}
     }
 
     public void save() {
         try {
-            // In Forge 1.4.7, we access the .value field directly on the Property object
             forge.get(CAT, "EnableController", true).value = String.valueOf(enableController);
-            forge.get(CAT, "LookSpeedX", 0.5).value = String.valueOf(lookSpeedX);
-            forge.get(CAT, "LookSpeedY", 0.5).value = String.valueOf(lookSpeedY);
-            forge.get(CAT, "Deadzone", 0.25).value = String.valueOf(deadzone);
-
-            for (ControllerAction action : ControllerAction.values()) {
-                // Same here for the bindings
-                forge.get(CAT_BINDINGS, action.name(), -1).value = String.valueOf(bindings[action.ordinal()]);
-            }
-
+            forge.get(CAT, "LookSpeedX",  0.5).value = String.valueOf(lookSpeedX);
+            forge.get(CAT, "LookSpeedY",  0.5).value = String.valueOf(lookSpeedY);
+            forge.get(CAT, "Deadzone",   0.25).value = String.valueOf(deadzone);
+            for (ControllerAction action : ControllerAction.values())
+                forge.get(CAT_BINDINGS, action.name(), UNDETECTED).value = String.valueOf(bindings[action.ordinal()]);
             forge.save();
-        } catch (Throwable t) {
-            System.out.println("[XInputMod] Failed to save config: " + t);
+        } catch (Throwable t) { System.out.println("[XInputMod] save failed: " + t); }
+    }
+
+    /**
+     * Called once after JInputController detects the plugged-in controller.
+     * Writes the actual JInput button indices for buttons that are still at
+     * their fallback values (i.e. user hasn't manually remapped them).
+     * Sentinels (-1, -110, -111, etc.) are left alone  they're correct
+     * regardless of controller layout.
+     */
+    public void applyDetectedDefaults(JInputController jinput) {
+        boolean changed = false;
+
+        int[] detected = new int[]{
+            /* JUMP           */ jinput.btnA(),
+            /* ATTACK         */ -1,          // always RT via cs.rt
+            /* USE_ITEM       */ -1,          // always LT via cs.lt
+            /* SNEAK          */ -111,        // always dpad down
+            /* SPRINT         */ -110,        // always dpad up
+            /* INVENTORY      */ jinput.btnY(),
+            /* DROP_ITEM      */ jinput.btnB(),
+            /* HOTBAR_PREV    */ -1,          // always dpad left
+            /* HOTBAR_NEXT    */ -1,          // always dpad right
+            /* RECIPE_BROWSER */ jinput.btnBack(),
+            /* PAUSE          */ jinput.btnStart(),
+            /* CHAT           */ jinput.btnBack(),
+            /* THIRD_PERSON   */ -1,
+            /* HIDE_HUD       */ -1,
+        };
+
+        for (ControllerAction action : ControllerAction.values()) {
+            int ord = action.ordinal();
+            if (ord >= detected.length) continue;
+            int current  = bindings[ord];
+            int fallback = fallbackFor(action);
+            int det      = detected[ord];
+            if ((current == fallback || current == UNDETECTED) && current != det) {
+                bindings[ord] = det;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            System.out.println("[XInputMod] Applied detected defaults, saving.");
+            save();
+        } else {
+            System.out.println("[XInputMod] Detected defaults match saved config.");
         }
     }
 
-    public int getBinding(ControllerAction action) {
-        return bindings[action.ordinal()];
-    }
+    public int     getBinding(ControllerAction a)           { return bindings[a.ordinal()]; }
+    public void    setBinding(ControllerAction a, int idx)  { bindings[a.ordinal()] = idx; }
+    public boolean matches(ControllerAction a, int idx)     { return bindings[a.ordinal()] == idx; }
 
-    public void setBinding(ControllerAction action, int buttonIndex) {
-        bindings[action.ordinal()] = buttonIndex;
-    }
-
-    /** Convenience: check if a raw JInput button index matches an action's binding. */
-    public boolean matches(ControllerAction action, int buttonIndex) {
-        return bindings[action.ordinal()] == buttonIndex;
+    private int fallbackFor(ControllerAction action) {
+        int ord = action.ordinal();
+        return ord < FALLBACK_DEFAULTS.length ? FALLBACK_DEFAULTS[ord] : -1;
     }
 }

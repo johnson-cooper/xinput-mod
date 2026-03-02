@@ -42,6 +42,50 @@ public class JInputController {
     private boolean initialised = false;
 
     // =========================================================================
+    // Public accessors  return the detected JInput button index for each
+    // logical button. Used by XInputTickHandler when forwarding button presses
+    // to the controller settings GUI so bindings store the correct index.
+    // =========================================================================
+
+    public int btnA()      { return btnA; }
+    public int btnB()      { return btnB; }
+    public int btnX()      { return btnX; }
+    public int btnY()      { return btnY; }
+    public int btnLB()     { return btnLB; }
+    public int btnRB()     { return btnRB; }
+    public int btnBack()   { return btnBack; }
+    public int btnStart()  { return btnStart; }
+    public int btnLStick() { return btnLStick; }
+    public int btnRStick() { return btnRStick; }
+
+    /**
+     * Returns true if the button at the given JInput index is currently pressed.
+     * Used by isActionPressed() to evaluate user-configured bindings by index,
+     * so the correct physical button is used regardless of layout/platform.
+     *
+     * Falls back to named cs.* fields for known indices so triggers/dpad
+     * handled elsewhere still work even if cs.* was set from a different path.
+     */
+    public boolean rawButtonPressed(int index, ControllerState cs) {
+        if (index < 0) return false;
+        // Map known logical indices back to cs.* fields so the result is
+        // always consistent with what poll() already computed.
+        if (index == btnA)      return cs.a;
+        if (index == btnB)      return cs.b;
+        if (index == btnX)      return cs.x;
+        if (index == btnY)      return cs.y;
+        if (index == btnLB)     return cs.lb;
+        if (index == btnRB)     return cs.rb;
+        if (index == btnBack)   return cs.back;
+        if (index == btnStart)  return cs.start;
+        if (index == btnLStick) return cs.lThumb;
+        if (index == btnRStick) return cs.rThumb;
+        // For any other index (e.g. extra buttons on unusual controllers)
+        // read directly from the buttons array populated during poll().
+        return btn(index);
+    }
+
+    // =========================================================================
     // Init
     // =========================================================================
 
@@ -294,7 +338,6 @@ public class JInputController {
                     btnDpadRight = i;
             }
 
-            // If we found any dpad button indices, show debug info
             if (btnDpadUp >= 0 || btnDpadDown >= 0 || btnDpadLeft >= 0 || btnDpadRight >= 0) {
                 System.out.println("[XInputMod] Detected D-pad as buttons: up=" + btnDpadUp + " down=" + btnDpadDown + " left=" + btnDpadLeft + " right=" + btnDpadRight);
             } else {
@@ -410,32 +453,25 @@ public class JInputController {
     private void readPOV(ControllerState cs) {
         cs.dpadUp = cs.dpadDown = cs.dpadLeft = cs.dpadRight = false;
 
-        // 1) If we have a POV component, use tolerant angle detection (handles drift/diagonals)
         if (compPOV != null) {
             try {
                 float pov = compPOV.getPollData();
-                // POV.OFF is 0.0f in many drivers (but some drivers use slightly different values)
                 if (pov == POV.OFF) return;
 
                 final float EPS = 0.02f;
-
-                // UP approx 0.25, RIGHT 0.5, DOWN 0.75, LEFT 1.0 (or 0.0 wrap)
                 if (Math.abs(pov - 0.25f) < EPS || (pov > 0.125f && pov < 0.375f)) cs.dpadUp = true;
                 if (Math.abs(pov - 0.50f) < EPS || (pov > 0.375f && pov < 0.625f)) cs.dpadRight = true;
                 if (Math.abs(pov - 0.75f) < EPS || (pov > 0.625f && pov < 0.875f)) cs.dpadDown = true;
-                if (Math.abs(pov - 1.00f) < EPS || pov > 0.875f || pov < 0.125f) cs.dpadLeft = true;
-
+                if (Math.abs(pov - 1.00f) < EPS || pov > 0.875f || pov < 0.125f)   cs.dpadLeft = true;
                 return;
             } catch (Throwable ignored) {}
         }
 
-        // 2) No POV component: fall back to button-index detection (if we detected names earlier)
-        if (btnDpadUp >= 0 && btnDpadUp < buttons.length && buttons[btnDpadUp] != null && buttons[btnDpadUp].getPollData() > 0.5f) cs.dpadUp = true;
-        if (btnDpadDown >= 0 && btnDpadDown < buttons.length && buttons[btnDpadDown] != null && buttons[btnDpadDown].getPollData() > 0.5f) cs.dpadDown = true;
-        if (btnDpadLeft >= 0 && btnDpadLeft < buttons.length && buttons[btnDpadLeft] != null && buttons[btnDpadLeft].getPollData() > 0.5f) cs.dpadLeft = true;
+        if (btnDpadUp    >= 0 && btnDpadUp    < buttons.length && buttons[btnDpadUp]    != null && buttons[btnDpadUp].getPollData()    > 0.5f) cs.dpadUp    = true;
+        if (btnDpadDown  >= 0 && btnDpadDown  < buttons.length && buttons[btnDpadDown]  != null && buttons[btnDpadDown].getPollData()  > 0.5f) cs.dpadDown  = true;
+        if (btnDpadLeft  >= 0 && btnDpadLeft  < buttons.length && buttons[btnDpadLeft]  != null && buttons[btnDpadLeft].getPollData()  > 0.5f) cs.dpadLeft  = true;
         if (btnDpadRight >= 0 && btnDpadRight < buttons.length && buttons[btnDpadRight] != null && buttons[btnDpadRight].getPollData() > 0.5f) cs.dpadRight = true;
 
-        // 3) If still nothing, try checking buttons for common word fragments (best-effort)
         if (!(cs.dpadUp || cs.dpadDown || cs.dpadLeft || cs.dpadRight)) {
             for (int i = 0; i < buttons.length; i++) {
                 Component b = buttons[i];
@@ -443,9 +479,9 @@ public class JInputController {
                 String name = b.getName() == null ? "" : b.getName().toLowerCase();
                 float pd = b.getPollData();
                 if (pd <= 0.5f) continue;
-                if (name.contains("up") || name.contains("dpad up") || name.contains("hat up")) cs.dpadUp = true;
-                if (name.contains("down") || name.contains("dpad down") || name.contains("hat down")) cs.dpadDown = true;
-                if (name.contains("left") || name.contains("dpad left") || name.contains("hat left")) cs.dpadLeft = true;
+                if (name.contains("up")    || name.contains("dpad up")    || name.contains("hat up"))    cs.dpadUp    = true;
+                if (name.contains("down")  || name.contains("dpad down")  || name.contains("hat down"))  cs.dpadDown  = true;
+                if (name.contains("left")  || name.contains("dpad left")  || name.contains("hat left"))  cs.dpadLeft  = true;
                 if (name.contains("right") || name.contains("dpad right") || name.contains("hat right")) cs.dpadRight = true;
             }
         }
