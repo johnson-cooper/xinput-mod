@@ -5,8 +5,8 @@ xinput mod - 1.4.7 minecraft forge mod using the jxinput library for controller 
 |---------|--------------------------|----------------------------------|
 | A       | Jump                     | Click / Drag                     |
 | B       | Drop                     | Right-click                       |
-| X       | Inventory                | Close GUI                         |
-| Y       | –                        | Shift-click / Auto-craft          |
+| X       | –                        | Close GUI                         |
+| Y       | Inventory                | Shift-click / Auto-craft          |
 | LB      | Hotbar left              | Scroll                            |
 | RB      | Hotbar right             | Scroll                            |
 | LT      | Use item                 | –                                 |
