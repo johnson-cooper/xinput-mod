@@ -237,24 +237,53 @@ public class JInputController {
         buttons = btnList.toArray(new Component[0]);
         System.out.println("[XInputMod] Button count: " + buttons.length);
 
-        // Default index map (fallback)
-        if (buttons.length >= 13) {
+        // Default index map   chosen by button count AND layout.
+        //
+        // Known layouts:
+        //
+        // Xbox 360 / generic 10-btn (Windows XInput via DirectInput fallback):
+        //   0=A 1=B 2=X 3=Y 4=LB 5=RB 6=Back 7=Start 8=LStick 9=RStick
+        //   Triggers: analog axes (STANDARD layout)
+        //
+        // Xbox One / One S / Series (Windows DirectInput, SHARED_Z, 16 btn):
+        //   0=A 1=B 2=X 3=Y 4=LB 5=RB 6=Back/View 7=Start/Menu 8=LStick 9=RStick
+        //   10=Xbox/Guide  11-15=extras (Share, Screenshot, etc.)
+        //   Triggers: shared Z axis (SHARED_Z layout)
+        //
+        // Xbox Wireless (Mac/Linux JInput, ZRZ_RSTICK, 15 btn):
+        //   0=A 1=B 2=X 3=Y 4=LB 5=RB 6=LT 7=RT 8=Back 9=Start 10=Xbox
+        //   11=LStick 12=RStick  13-14=extras
+        //   Triggers: digital buttons 6/7 (ZRZ_RSTICK layout)
+
+        if (layout == Layout.SHARED_Z && buttons.length >= 10) {
+            // Xbox One on Windows DirectInput   Back and Start are at 6/7,
+            // LStick/RStick are at 8/9.  No dedicated trigger buttons.
+            btnA=0; btnB=1; btnX=2; btnY=3;
+            btnLB=4; btnRB=5;
+            btnLT=-1; btnRT=-1;   // triggers come from shared Z axis
+            btnBack=6; btnStart=7;
+            btnLStick=8; btnRStick=9;
+            System.out.println("[XInputMod] Default button map: Xbox One DirectInput / SHARED_Z");
+        } else if (buttons.length >= 13) {
+            // Xbox Wireless on Mac/Linux (ZRZ_RSTICK, 15 btn)
+            // or any other 13+ btn controller that isn't SHARED_Z
             btnA=0; btnB=1; btnX=2; btnY=3;
             btnLB=4; btnRB=5;
             btnLT=6; btnRT=7;
             btnBack=8; btnStart=9;
             btnLStick=11; btnRStick=12;
-            System.out.println("[XInputMod] Default button map: Xbox Wireless (13+ btn)");
+            System.out.println("[XInputMod] Default button map: Xbox Wireless 13+ btn");
         } else {
+            // Xbox 360 / generic 10-button
             btnA=0; btnB=1; btnX=2; btnY=3;
             btnLB=4; btnRB=5;
             btnLT=-1; btnRT=-1;
             btnBack=6; btnStart=7;
             btnLStick=8; btnRStick=9;
-            System.out.println("[XInputMod] Default button map: Xbox 360 standard (10 btn)");
+            System.out.println("[XInputMod] Default button map: Xbox 360 standard 10 btn");
         }
 
-        //    Name-based button detection                                          
+        //  Name-based button detection 
         // Covers every known naming convention across Xbox, PlayStation, Nintendo,
         // and generic HID drivers. Many controllers (including Xbox Wireless on Mac
         // via JInput) report no names at all   that case is handled by the
@@ -275,7 +304,7 @@ public class JInputController {
             String n = raw.toLowerCase().trim();
             if (n.isEmpty()) continue;
 
-            //    Start / Menu equivalents                                   
+            //  Start / Menu equivalents 
             // Xbox: "start" | Xbox One/S/X/Series: "menu" | PS: "options" | PS3: "start"
             // Switch: "plus" | Generic: "mode" "guide" "home" "pause" "system"
             if (foundStart == -1) {
@@ -288,7 +317,7 @@ public class JInputController {
                 }
             }
 
-            //    Back / Select / Share equivalents                          
+            //  Back / Select / Share equivalents 
             // Xbox 360: "back" | Xbox One/S/X: "view" | PS1-3: "select" | PS4/5: "share" "create"
             // Switch: "minus" | Generic: "select" "capture" "screenshot"
             if (foundBack == -1) {
@@ -302,7 +331,7 @@ public class JInputController {
                 }
             }
 
-            //    Left stick click                                           
+            //  Left stick click 
             // Xbox: "left thumb" | PS: "l3" | Generic: "lstick" "left stick" "l thumb"
             if (foundLStick == -1) {
                 if (n.equals("l3") || n.equals("ls")
@@ -314,7 +343,7 @@ public class JInputController {
                 }
             }
 
-            //    Right stick click                                          
+            //  Right stick click 
             // Xbox: "right thumb" | PS: "r3" | Generic: "rstick" "right stick" "r thumb"
             if (foundRStick == -1) {
                 if (n.equals("r3") || n.equals("rs")
@@ -326,7 +355,7 @@ public class JInputController {
                 }
             }
 
-            //    Left bumper / shoulder                                     
+            //  Left bumper / shoulder 
             // Xbox: "left shoulder" | PS: "l1" | Generic: "lb" "l1" "leftshoulder"
             if (foundLB == -1) {
                 if (n.equals("l1") || n.equals("lb")
@@ -337,7 +366,7 @@ public class JInputController {
                 }
             }
 
-            //    Right bumper / shoulder                                    
+            //  Right bumper / shoulder 
             // Xbox: "right shoulder" | PS: "r1" | Generic: "rb" "r1" "rightshoulder"
             if (foundRB == -1) {
                 if (n.equals("r1") || n.equals("rb")
@@ -356,30 +385,30 @@ public class JInputController {
 
         if (foundStart >= 0 && !faceIndices[foundStart]) {
             btnStart = foundStart;
-
+            
         }
         if (foundBack >= 0 && !faceIndices[foundBack]) {
             btnBack = foundBack;
-
+          
         }
         if (foundLStick >= 0) {
             btnLStick = foundLStick;
-
+          
         }
         if (foundRStick >= 0) {
             btnRStick = foundRStick;
-
+           
         }
         if (foundLB >= 0 && !faceIndices[foundLB]) {
             btnLB = foundLB;
-
+           
         }
         if (foundRB >= 0 && !faceIndices[foundRB]) {
             btnRB = foundRB;
-
+            
         }
 
-        //    Identifier-based detection (fallback for drivers using id strings)   
+        //  Identifier-based detection (fallback for drivers using id strings) 
         // Some HID drivers set the Identifier string rather than the display name.
         // We run this only for indices we haven't resolved yet.
         if (foundStart == -1 || foundBack == -1 || foundLStick == -1 || foundRStick == -1) {
@@ -391,25 +420,25 @@ public class JInputController {
                         && (id.contains("start") || id.contains("menu") || id.contains("options")
                             || id.contains("guide") || id.contains("plus"))) {
                     btnStart = i; foundStart = i;
-                    
+                    ;
                 }
                 if (foundBack == -1 && !faceIndices[i]
                         && (id.contains("back") || id.contains("select") || id.contains("view")
                             || id.contains("share") || id.contains("create") || id.contains("minus"))) {
                     btnBack = i; foundBack = i;
-                    
+                   
                 }
                 if (foundLStick == -1
                         && (id.contains("lstick") || id.contains("left stick") || id.contains("left thumb")
                             || id.contains("l3") || (id.contains("thumb") && id.contains("left")))) {
                     btnLStick = i; foundLStick = i;
-                    
+                   
                 }
                 if (foundRStick == -1
                         && (id.contains("rstick") || id.contains("right stick") || id.contains("right thumb")
                             || id.contains("r3") || (id.contains("thumb") && id.contains("right")))) {
                     btnRStick = i; foundRStick = i;
-                    
+                   
                 }
             }
         }
@@ -543,7 +572,7 @@ public class JInputController {
                 for (int _i = 0; _i < buttons.length && _i < debugLoggedButton.length; _i++) {
                     if (!debugLoggedButton[_i] && buttons[_i] != null && buttons[_i].getPollData() > 0.5f) {
                         debugLoggedButton[_i] = true;
-                       
+                      
                     }
                 }
             }
