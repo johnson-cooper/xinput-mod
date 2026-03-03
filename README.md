@@ -13,9 +13,9 @@ xinput mod - 1.4.7 minecraft forge mod using the jxinput library for controller 
 | RT      | Attack                   | –                                 |
 | Back    | Chat / Recipe Browser    | Close / Open Recipe Browser       |
 | Start   | Pause Menu               | Close GUI                         |
-| LThumb  | Toggle Sprint            | –                                 |
-| RThumb  | Sneak (hold)             | –                                 |
-| D-Pad   | Third-person / HUD / Hotbar | Scroll / Hotbar                |
+| LThumb  | -                        | –                                 |
+| RThumb  | -                        | –                                 |
+| D-Pad   | Sneak / Hotbar / Sprint  | Scroll / Hotbar                   |
 | LStick  | Move player              | Move cursor                       |
 | RStick  | Camera / optional GUI    | Move cursor (if implemented)      |
 
