@@ -8,6 +8,11 @@ public class XInputConfig {
     private static final String CAT          = "general";
     private static final String CAT_BINDINGS = "bindings";
 
+    // Bump this number whenever the default binding layout changes.
+    // If the saved version doesn't match, all bindings are reset and
+    // re-detected fresh  fixes stale configs from old mod versions.
+    private static final int CONFIG_VERSION = 3;
+
     public static final int UNDETECTED = -99;
 
     private final Configuration forge;
@@ -19,7 +24,7 @@ public class XInputConfig {
 
     private final int[] bindings = new int[ControllerAction.values().length];
 
-    // Fallback defaults   must stay aligned with ControllerAction ordinals.
+    // Fallback defaults  must stay aligned with ControllerAction ordinals.
     // -1 means "use hardware default" (handled in isActionPressed switch).
     // Sentinels from XInputTickHandler are used for dpad/trigger bindings.
     //
@@ -37,9 +42,9 @@ public class XInputConfig {
         /* DROP_ITEM      */  1,    // B
         /* HOTBAR_PREV    */ -1,    // dpad left (hardware default)
         /* HOTBAR_NEXT    */ -1,    // dpad right (hardware default)
-        /* RECIPE_BROWSER */  8,    // Back   overridden by applyDetectedDefaults()
-        /* PAUSE          */  9,    // Start   overridden by applyDetectedDefaults()
-        /* CHAT           */  8,    // Back    overridden by applyDetectedDefaults()
+        /* RECIPE_BROWSER */  8,    // Back  overridden by applyDetectedDefaults()
+        /* PAUSE          */  9,    // Start  overridden by applyDetectedDefaults()
+        /* CHAT           */  8,    // Back   overridden by applyDetectedDefaults()
         /* THIRD_PERSON   */ -1,    // unbound (was dpad up, now taken by sprint)
         /* HIDE_HUD       */ -1,    // unbound
     };
@@ -56,12 +61,30 @@ public class XInputConfig {
         lookSpeedY = (float) forge.get(CAT, "LookSpeedY",  0.5).getDouble(0.5);
         deadzone   = (float) forge.get(CAT, "Deadzone",   0.25).getDouble(0.25);
 
+        // Version check: if saved version differs, wipe bindings so
+        // applyDetectedDefaults() rewrites them correctly on next poll.
+        int savedVersion = forge.get(CAT, "ConfigVersion", 0).getInt(0);
+        boolean versionMismatch = (savedVersion != CONFIG_VERSION);
+        if (versionMismatch) {
+            System.out.println("[XInputMod] Config version changed (" + savedVersion
+                + " -> " + CONFIG_VERSION + "), resetting bindings for re-detection.");
+        }
+
         for (ControllerAction action : ControllerAction.values()) {
             int fallback = fallbackFor(action);
-            int saved = forge.get(CAT_BINDINGS, action.name(), UNDETECTED).getInt(UNDETECTED);
-            bindings[action.ordinal()] = (saved == UNDETECTED) ? fallback : saved;
+            if (versionMismatch) {
+                // Force all bindings back to UNDETECTED so applyDetectedDefaults
+                // overwrites every one of them fresh
+                bindings[action.ordinal()] = UNDETECTED;
+            } else {
+                int saved = forge.get(CAT_BINDINGS, action.name(), UNDETECTED).getInt(UNDETECTED);
+                bindings[action.ordinal()] = (saved == UNDETECTED) ? fallback : saved;
+            }
         }
-        try { forge.save(); } catch (Throwable ignored) {}
+        // Do NOT save here. Saving fallback/UNDETECTED values to disk before
+        // applyDetectedDefaults() runs would cause them to look like user choices
+        // on the next launch, preventing auto-correction. Save only happens after
+        // detection (applyDetectedDefaults/applyJXInputDefaults) or user action.
     }
 
     public void save() {
@@ -70,6 +93,7 @@ public class XInputConfig {
             forge.get(CAT, "LookSpeedX",  0.5).value = String.valueOf(lookSpeedX);
             forge.get(CAT, "LookSpeedY",  0.5).value = String.valueOf(lookSpeedY);
             forge.get(CAT, "Deadzone",   0.25).value = String.valueOf(deadzone);
+            forge.get(CAT, "ConfigVersion", 0).value = String.valueOf(CONFIG_VERSION);
             for (ControllerAction action : ControllerAction.values())
                 forge.get(CAT_BINDINGS, action.name(), UNDETECTED).value = String.valueOf(bindings[action.ordinal()]);
             forge.save();
@@ -80,7 +104,7 @@ public class XInputConfig {
      * Called once after JInputController detects the plugged-in controller.
      * Writes the actual JInput button indices for buttons that are still at
      * their fallback values (i.e. user hasn't manually remapped them).
-     * Sentinels (-1, -110, -111, etc.) are left alone   they're correct
+     * Sentinels (-1, -110, -111, etc.) are left alone  they're correct
      * regardless of controller layout.
      */
     public void applyDetectedDefaults(JInputController jinput) {

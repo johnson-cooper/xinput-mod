@@ -25,15 +25,15 @@ public class XInputGuiRenderer implements ITickHandler {
     private float smoothRx = 0f;
     private float smoothRy = 0f;
 
-    // Blank 1 1 cursor  hides OS cursor while leaving mouse ungrabbed
-    private Cursor blankCursor  = null;
-    private boolean blankCursorFailed = false;
+    // Blank 11 cursor  hides OS cursor while leaving mouse ungrabbed (Windows/Linux)
+    private Cursor blankCursor      = null;
+    private boolean blankCursorFailed = false; // true if platform doesn't support native cursors (Mac)
 
-    // Track whether we installed the blank cursor this GUI session
-    private boolean blankInstalled = false;
+    // Whether we have set up this GUI session yet
+    private boolean guiSessionActive = false;
 
-    // Previous OS cursor position in physical pixels (LWJGL bottom-left origin)
-    // Used to detect physical mouse movement and apply it to virtual cursor.
+    // Previous OS cursor position in physical pixels (LWJGL bottom-left origin).
+    // Set to -1 when invalid / needs reinitialisation.
     private int prevMousePx = -1;
     private int prevMousePy = -1;
 
@@ -54,98 +54,135 @@ public class XInputGuiRenderer implements ITickHandler {
 
     @Override
     public void tickEnd(EnumSet<TickType> type, Object... tickData) {
-        // If controller disabled: restore everything to vanilla state and do nothing.
+
+        //  Controller disabled: full vanilla restore 
         if (XInputMod.config != null && !XInputMod.config.enableController) {
-            if (blankInstalled) {
-                try { Mouse.setNativeCursor(null); } catch (Throwable ignored) {}
-                blankInstalled = false;
-            }
-            // Let Minecraft regrab the mouse normally when in-game
-            try { if (!Mouse.isGrabbed() && mc.currentScreen == null && mc.inGameHasFocus)
-                Mouse.setGrabbed(true); } catch (Throwable ignored) {}
-            prevMousePx = -1;
-            prevMousePy = -1;
+            teardownGuiSession();
+            try {
+                if (!Mouse.isGrabbed() && mc.currentScreen == null && mc.inGameHasFocus)
+                    Mouse.setGrabbed(true);
+            } catch (Throwable ignored) {}
             return;
         }
 
+        //  No GUI open: gameplay mode 
         if (mc.currentScreen == null) {
-            //  Gameplay 
-            // Restore normal cursor and regrab
-            if (blankInstalled) {
-                try { Mouse.setNativeCursor(null); } catch (Throwable ignored) {}
-                blankInstalled = false;
-            }
-            try { if (!Mouse.isGrabbed() && mc.inGameHasFocus) Mouse.setGrabbed(true); }
-            catch (Throwable ignored) {}
-            prevMousePx = -1;
-            prevMousePy = -1;
+            teardownGuiSession();
+            try {
+                if (!Mouse.isGrabbed() && mc.inGameHasFocus)
+                    Mouse.setGrabbed(true);
+            } catch (Throwable ignored) {}
             return;
         }
 
         //  GUI is open 
-        // 1. Ungrab so Minecraft stops processing mouse input for camera
+
+        // Step 1: Ungrab mouse so Minecraft stops consuming events for camera
         try { if (Mouse.isGrabbed()) Mouse.setGrabbed(false); }
         catch (Throwable ignored) {}
 
-        // 2. Install blank cursor to hide the OS cursor (we draw our own)
-        if (!blankInstalled) {
-            installBlankCursor();
-            // Initialise virtual cursor to screen centre on first open
-            ScaledResolution sr = getScaledResolution();
-            state.cursorGuiX    = sr.getScaledWidth()  / 2f;
-            state.cursorGuiY    = sr.getScaledHeight() / 2f;
-            state.cursorInitialised = true;
-            // Warp OS cursor to match so getCursorPosition reports a sane value
-            warpOsCursorToVirtual(sr);
-            prevMousePx = Mouse.getX();
-            prevMousePy = Mouse.getY();
+        // Step 2: One-time session setup when GUI first opens
+        if (!guiSessionActive) {
+            setupGuiSession();
         }
 
-        // 3. Apply physical mouse movement (delta from last frame)
+        // Step 3: Apply physical mouse movement (delta from last OS cursor position)
         applyPhysicalMouseDelta();
 
-        // 4. Apply controller stick movement
+        // Step 4: Apply controller left-stick movement to virtual cursor
         applyStickDelta();
 
-        // 5. When stick moves, warp OS cursor to our virtual position so that
-        //    Minecraft's own slot-hover and button-hover logic (which reads
-        //    the real OS cursor) stays in sync.
+        // Step 5: When stick moves, sync OS cursor to virtual position so that
+        //         Minecraft's slot-hover / button-hover logic (reads real OS cursor)
+        //         stays in sync. Only on stick movement to avoid Mac snap-back.
         if (state.stickMovedThisTick) {
-            ScaledResolution sr = getScaledResolution();
-            warpOsCursorToVirtual(sr);
+            warpOsCursorToVirtual();
         }
-
         state.stickMovedThisTick = false;
 
-        // 6. Recipe browser overlay
+        // Step 6: Recipe browser overlay
         if (tickHandler != null && tickHandler.recipeBrowser.isOpen) {
             ScaledResolution sr = getScaledResolution();
             tickHandler.recipeBrowser.render(sr.getScaledWidth(), sr.getScaledHeight());
         }
 
-        // 7. Draw our crosshair at the virtual position
+        // Step 7: Draw our crosshair at the virtual cursor position
         drawCrosshair();
+    }
+
+    // =========================================================================
+    // Session setup / teardown
+    // =========================================================================
+
+    /**
+     * Called once when a GUI opens.  Initialises the virtual cursor to screen
+     * centre, installs blank cursor (if supported), and records OS cursor
+     * position so the first delta is zero.
+     */
+    private void setupGuiSession() {
+        guiSessionActive = true;
+
+        ScaledResolution sr = getScaledResolution();
+        // Place virtual cursor at screen centre
+        state.cursorGuiX = sr.getScaledWidth()  / 2f;
+        state.cursorGuiY = sr.getScaledHeight() / 2f;
+        state.cursorInitialised = true;
+
+        // Try to install a blank native cursor (hides OS cursor on Windows/Linux).
+        // On Mac this throws "Native cursors not supported"  we catch it and
+        // leave blankCursorFailed=true so we never retry.
+        if (!blankCursorFailed) {
+            tryInstallBlankCursor();
+        }
+
+        // Warp the OS cursor to our virtual position.
+        // On Mac (ungrabbed, no blank cursor): this moves the visible OS cursor
+        // to screen centre, which is where we want it to start.
+        // On Windows/Linux (blank cursor): keeps hover logic in sync.
+        warpOsCursorToVirtual();
+
+        // Record OS cursor position AFTER the warp so first delta is zero.
+        prevMousePx = Mouse.getX();
+        prevMousePy = Mouse.getY();
+    }
+
+    /**
+     * Called when leaving GUI (game or disabled).  Removes blank cursor and
+     * resets session state.
+     */
+    private void teardownGuiSession() {
+        if (!guiSessionActive) return;
+        guiSessionActive = false;
+
+        // Remove blank cursor  restore OS cursor to normal
+        if (!blankCursorFailed) {
+            try { Mouse.setNativeCursor(null); } catch (Throwable ignored) {}
+        }
+
+        prevMousePx = -1;
+        prevMousePy = -1;
     }
 
     // =========================================================================
     // Blank cursor
     // =========================================================================
 
-    private void installBlankCursor() {
-        if (blankCursorFailed) return;
+    private void tryInstallBlankCursor() {
         try {
             if (blankCursor == null) {
-                // 1 1 transparent cursor
                 IntBuffer buf = org.lwjgl.BufferUtils.createIntBuffer(1);
                 buf.put(0, 0x00000000);
                 blankCursor = new Cursor(1, 1, 0, 0, 1, buf, null);
             }
             Mouse.setNativeCursor(blankCursor);
-            blankInstalled = true;
+            System.out.println("[XInputMod] Blank cursor installed.");
         } catch (Throwable t) {
-            System.out.println("[XInputMod] Blank cursor failed: " + t + "  falling back to plain ungrab.");
+            System.out.println("[XInputMod] Blank cursor not supported (" + t.getMessage()
+                + ")  OS cursor will be visible in GUIs.");
             blankCursorFailed = true;
-            blankInstalled = true; // don't retry
+            // Don't treat this as an error  Mac works fine with the OS cursor
+            // visible; the virtual crosshair is still drawn and warping still
+            // keeps them in sync.
         }
     }
 
@@ -155,14 +192,26 @@ public class XInputGuiRenderer implements ITickHandler {
 
     /**
      * Read how far the real OS cursor moved since last frame and apply that
-     * delta to our virtual cursor.  This way a physical mouse still works
+     * delta to the virtual cursor so physical mouse movement still works
      * normally while a GUI is open.
+     *
+     * On Mac (ungrabbed, no blank cursor): Mouse.getX()/getY() returns the
+     * actual OS cursor position in window pixels.  Delta tracking works
+     * correctly because we record prevMousePx/Py after every warp.
+     *
+     * On Windows (blank cursor): same approach.
      */
     private void applyPhysicalMouseDelta() {
         try {
             int mx = Mouse.getX();
             int my = Mouse.getY();
-            if (prevMousePx < 0) { prevMousePx = mx; prevMousePy = my; return; }
+
+            // Guard: if prev is invalid, just record and return (no delta yet)
+            if (prevMousePx < 0) {
+                prevMousePx = mx;
+                prevMousePy = my;
+                return;
+            }
 
             int dpx = mx - prevMousePx;
             int dpy = my - prevMousePy;
@@ -173,15 +222,17 @@ public class XInputGuiRenderer implements ITickHandler {
 
             ScaledResolution sr = getScaledResolution();
             int scale = Math.max(1, sr.getScaleFactor());
-            // LWJGL Y is bottom-up; GUI Y is top-down, so flip dpy
-            state.cursorGuiX = clamp(state.cursorGuiX + dpx / (float) scale, 0, sr.getScaledWidth()  - 1);
-            state.cursorGuiY = clamp(state.cursorGuiY - dpy / (float) scale, 0, sr.getScaledHeight() - 1);
+            // LWJGL Y is bottom-up; GUI Y is top-down  flip dpy
+            state.cursorGuiX = clamp(state.cursorGuiX + dpx / (float) scale,
+                0, sr.getScaledWidth()  - 1);
+            state.cursorGuiY = clamp(state.cursorGuiY - dpy / (float) scale,
+                0, sr.getScaledHeight() - 1);
         } catch (Throwable ignored) {}
     }
 
     /**
-     * Move virtual cursor using controller left stick, then warp the OS cursor
-     * to match so Minecraft's hover logic stays in sync.
+     * Move the virtual cursor using the controller left stick.
+     * Sets stickMovedThisTick=true so tickEnd knows to warp the OS cursor.
      */
     private void applyStickDelta() {
         float dx = processAxis(state.rawLx, 0.15f);
@@ -193,31 +244,42 @@ public class XInputGuiRenderer implements ITickHandler {
 
         try {
             ScaledResolution sr = getScaledResolution();
-            state.cursorGuiX = clamp(state.cursorGuiX + dx * speed, 0, sr.getScaledWidth()  - 1);
-            state.cursorGuiY = clamp(state.cursorGuiY - dy * speed, 0, sr.getScaledHeight() - 1);
+            state.cursorGuiX = clamp(state.cursorGuiX + dx * speed,
+                0, sr.getScaledWidth()  - 1);
+            // Left stick Y: positive = up on stick = up on screen (invert)
+            state.cursorGuiY = clamp(state.cursorGuiY - dy * speed,
+                0, sr.getScaledHeight() - 1);
             state.stickMovedThisTick = true;
         } catch (Throwable ignored) {}
     }
 
     /**
      * Move the real OS cursor to match our virtual GUI position.
-     * Only called when the stick actually moved  avoids the Mac "snap-back"
-     * issue that occurs when setCursorPosition is called every frame.
      *
-     * LWJGL setCursorPosition uses window-space pixels, origin bottom-left.
+     * LWJGL setCursorPosition uses window-pixel coordinates, origin bottom-left.
      * Virtual cursor is in scaled GUI coords, origin top-left.
+     *
+     * After warping we update prevMousePx/Py so applyPhysicalMouseDelta does
+     * not see a spurious jump next frame.
+     *
+     * On Mac: called only on stick movement (not every frame) to avoid the
+     * OS "snap-back" that occurs when setCursorPosition is called continuously
+     * while the OS cursor is also being driven by the trackpad/physical mouse.
      */
-    private void warpOsCursorToVirtual(ScaledResolution sr) {
+    private void warpOsCursorToVirtual() {
         try {
+            ScaledResolution sr = getScaledResolution();
             int scale = Math.max(1, sr.getScaleFactor());
+
             int px = (int)(state.cursorGuiX * scale);
             // Flip Y: LWJGL y=0 is bottom of window
             int py = mc.displayHeight - (int)(state.cursorGuiY * scale) - 1;
             px = Math.max(0, Math.min(mc.displayWidth  - 1, px));
             py = Math.max(0, Math.min(mc.displayHeight - 1, py));
+
             Mouse.setCursorPosition(px, py);
-            // Update our "previous" position so applyPhysicalMouseDelta
-            // doesn't see a spurious jump next frame
+
+            // Re-read actual position after warp (may be clamped by OS)
             prevMousePx = Mouse.getX();
             prevMousePy = Mouse.getY();
         } catch (Throwable ignored) {}
@@ -273,6 +335,7 @@ public class XInputGuiRenderer implements ITickHandler {
             smoothRy *= (1f - SMOOTH_ALPHA);
             return;
         }
+
         float procRx = processAxis(state.rawRx, LOOK_DEADZONE);
         float procRy = processAxis(state.rawRy, LOOK_DEADZONE);
         smoothRx += (procRx - smoothRx) * SMOOTH_ALPHA;
