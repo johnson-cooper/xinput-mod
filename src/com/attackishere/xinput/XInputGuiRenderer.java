@@ -25,7 +25,7 @@ public class XInputGuiRenderer implements ITickHandler {
     private float smoothRx = 0f;
     private float smoothRy = 0f;
 
-    // Blank 11 cursor  hides OS cursor while leaving mouse ungrabbed
+    // Blank 1 1 cursor  hides OS cursor while leaving mouse ungrabbed
     private Cursor blankCursor  = null;
     private boolean blankCursorFailed = false;
 
@@ -54,6 +54,20 @@ public class XInputGuiRenderer implements ITickHandler {
 
     @Override
     public void tickEnd(EnumSet<TickType> type, Object... tickData) {
+        // If controller disabled: restore everything to vanilla state and do nothing.
+        if (XInputMod.config != null && !XInputMod.config.enableController) {
+            if (blankInstalled) {
+                try { Mouse.setNativeCursor(null); } catch (Throwable ignored) {}
+                blankInstalled = false;
+            }
+            // Let Minecraft regrab the mouse normally when in-game
+            try { if (!Mouse.isGrabbed() && mc.currentScreen == null && mc.inGameHasFocus)
+                Mouse.setGrabbed(true); } catch (Throwable ignored) {}
+            prevMousePx = -1;
+            prevMousePy = -1;
+            return;
+        }
+
         if (mc.currentScreen == null) {
             //  Gameplay 
             // Restore normal cursor and regrab
@@ -121,7 +135,7 @@ public class XInputGuiRenderer implements ITickHandler {
         if (blankCursorFailed) return;
         try {
             if (blankCursor == null) {
-                // 11 transparent cursor
+                // 1 1 transparent cursor
                 IntBuffer buf = org.lwjgl.BufferUtils.createIntBuffer(1);
                 buf.put(0, 0x00000000);
                 blankCursor = new Cursor(1, 1, 0, 0, 1, buf, null);
@@ -252,6 +266,7 @@ public class XInputGuiRenderer implements ITickHandler {
     // =========================================================================
 
     private void applyControllerLook() {
+        if (XInputMod.config != null && !XInputMod.config.enableController) return;
         EntityPlayer player = mc.thePlayer;
         if (player == null || mc.currentScreen != null) {
             smoothRx *= (1f - SMOOTH_ALPHA);

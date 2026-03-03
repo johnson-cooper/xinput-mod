@@ -11,6 +11,7 @@ import net.minecraft.client.gui.inventory.GuiContainer;
 import net.minecraft.client.gui.inventory.GuiInventory;
 import net.minecraft.client.gui.GuiChat;
 import net.minecraft.client.settings.KeyBinding;
+import org.lwjgl.input.Mouse;
 import net.minecraft.inventory.Slot;
 
 import java.lang.reflect.Field;
@@ -52,10 +53,11 @@ public class XInputTickHandler implements ITickHandler {
     private static final long DRAG_THRESHOLD_MS = 200;
 
     private GuiScreen lastScreen = null;
+    private boolean stickWasDrivingMovement = false;
     private int  debugCounter   = 0;
     private boolean defaultsApplied = false;
 
-    // ── Sentinels stored in config for non-button inputs ─────────────────────
+    //  Sentinels stored in config for non-button inputs 
     // Positive values are JInput button indices.
     // Negative values are sentinels meaning "use the hardware axis/hat directly".
     public static final int BIND_LT_SENTINEL  = -100;
@@ -82,6 +84,19 @@ public class XInputTickHandler implements ITickHandler {
         if (!XInputMod.modEnabled) return;
 
         GuiControlsInjector.tick(mc, XInputMod.config);
+
+        // If controller is disabled in settings, release all keys and do nothing else.
+        // The GUI injector and settings screen still work so the user can re-enable.
+        if (XInputMod.config != null && !XInputMod.config.enableController) {
+            releaseMovementKeys();
+            // Ensure mouse is grabbed so normal gameplay works
+            try { if (!Mouse.isGrabbed() && mc.currentScreen == null && mc.inGameHasFocus)
+                Mouse.setGrabbed(true); } catch (Throwable ignored) {}
+            for (int i = 0; i < prevActionPressed.length; i++) prevActionPressed[i] = false;
+            state.rawRx = 0f; state.rawRy = 0f;
+            state.rawLx = 0f; state.rawLy = 0f;
+            return;
+        }
 
         boolean ok = pollController();
         if (!ok) {
@@ -113,7 +128,11 @@ public class XInputTickHandler implements ITickHandler {
         boolean inGui = mc.currentScreen != null;
         if (inGui) {
             handleGuiWithActionEdges(cur);
-            releaseMovementKeys();
+            // Only release movement keys the stick was driving; leave keyboard alone
+            if (stickWasDrivingMovement) {
+                releaseMovementKeys();
+                stickWasDrivingMovement = false;
+            }
         } else {
             state.cursorInitialised  = false;
             state.stickMovedThisTick = false;
@@ -176,7 +195,7 @@ public class XInputTickHandler implements ITickHandler {
             else log("No controller backend available.");
         }
         if (usingJXInput && jxController != null) return pollJXInput();
-        // JXInput device lost — retry next tick
+        // JXInput device lost  retry next tick
         if (usingJXInput && jxController == null) jxInitAttempted = false;
         cs.zero();
         return false;
@@ -348,22 +367,35 @@ public class XInputTickHandler implements ITickHandler {
 
     private void handleGameplay(boolean[] cur) {
         // Movement (left stick)
+        // IMPORTANT: only touch movement keybinds when the stick is outside the
+        // deadzone. If the stick is centred, leave vanilla keyboard input alone 
+        // otherwise we zero pressTime every tick and break keyboard movement.
         float px = processAxis(cs.lx, MOVE_DEADZONE);
         float py = processAxis(cs.ly, MOVE_DEADZONE);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode,  py >  0.001f);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode,     py < -0.001f);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindLeft.keyCode,     px < -0.001f);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.keyCode,    px >  0.001f);
+        boolean stickActive = Math.abs(px) > 0.001f || Math.abs(py) > 0.001f;
+        if (stickActive) {
+            setKey(mc.gameSettings.keyBindForward, py >  0.001f);
+            setKey(mc.gameSettings.keyBindBack,    py < -0.001f);
+            setKey(mc.gameSettings.keyBindLeft,    px < -0.001f);
+            setKey(mc.gameSettings.keyBindRight,   px >  0.001f);
+        }
+        // When stick returns to centre, release only the keys the stick was driving.
+        // We track which ones we last set so we don't release keys the keyboard holds.
+        else if (stickWasDrivingMovement) {
+            setKey(mc.gameSettings.keyBindForward, false);
+            setKey(mc.gameSettings.keyBindBack,    false);
+            setKey(mc.gameSettings.keyBindLeft,    false);
+            setKey(mc.gameSettings.keyBindRight,   false);
+        }
+        stickWasDrivingMovement = stickActive;
 
-        // Held actions (set every tick)
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode,
-            cur[ControllerAction.USE_ITEM.ordinal()]);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindAttack.keyCode,
-            cur[ControllerAction.ATTACK.ordinal()]);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode,
-            cur[ControllerAction.JUMP.ordinal()]);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSneak.keyCode,
-            cur[ControllerAction.SNEAK.ordinal()]);
+        // Held actions: only set when controller triggers them; never clear keyboard binds.
+        // Jump/Sneak/Attack/UseItem are safe to always write because they are
+        // not typically held via keyboard at the same time as a controller.
+        setKey(mc.gameSettings.keyBindUseItem, cur[ControllerAction.USE_ITEM.ordinal()]);
+        setKey(mc.gameSettings.keyBindAttack,  cur[ControllerAction.ATTACK.ordinal()]);
+        setKey(mc.gameSettings.keyBindJump,    cur[ControllerAction.JUMP.ordinal()]);
+        setKey(mc.gameSettings.keyBindSneak,   cur[ControllerAction.SNEAK.ordinal()]);
 
         // Edge-triggered actions
         if (cur[ControllerAction.ATTACK.ordinal()]
@@ -406,12 +438,12 @@ public class XInputTickHandler implements ITickHandler {
                 && !prevActionPressed[ControllerAction.HIDE_HUD.ordinal()])
             mc.gameSettings.hideGUI = !mc.gameSettings.hideGUI;
 
-        // Pause — go through the action system so remapping works
+        // Pause  go through the action system so remapping works
         if (cur[ControllerAction.PAUSE.ordinal()]
                 && !prevActionPressed[ControllerAction.PAUSE.ordinal()])
             openPauseMenu();
 
-        // Recipe browser (only while a container GUI is open — handled separately)
+        // Recipe browser (only while a container GUI is open  handled separately)
         if (cur[ControllerAction.RECIPE_BROWSER.ordinal()]
                 && !prevActionPressed[ControllerAction.RECIPE_BROWSER.ordinal()]
                 && mc.thePlayer != null
@@ -438,7 +470,7 @@ public class XInputTickHandler implements ITickHandler {
             lastScreen = screen;
         }
 
-        // ── Controller settings binding listener ──────────────────────────────
+        //  Controller settings binding listener 
         // Must see every raw button press before anything else consumes it.
         if (screen instanceof GuiControllerSettings) {
             GuiControllerSettings gs = (GuiControllerSettings) screen;
@@ -475,7 +507,7 @@ public class XInputTickHandler implements ITickHandler {
         int mouseX = (int) state.cursorGuiX;
         int mouseY = (int) state.cursorGuiY;
 
-        // ── Recipe browser toggle (uses action system for remappability) ───────
+        //  Recipe browser toggle (uses action system for remappability) 
         if (cur[ControllerAction.RECIPE_BROWSER.ordinal()]
                 && !prevActionPressed[ControllerAction.RECIPE_BROWSER.ordinal()]) {
             if (screen instanceof GuiContainer) {
@@ -485,7 +517,7 @@ public class XInputTickHandler implements ITickHandler {
             }
         }
 
-        // ── Recipe browser consumes all input while open ───────────────────────
+        //  Recipe browser consumes all input while open 
         if (recipeBrowser.isOpen) {
             if (cs.dpadUp   && !prevDpadUp)   recipeBrowser.scroll(-1);
             if (cs.dpadDown && !prevDpadDown) recipeBrowser.scroll(1);
@@ -495,7 +527,7 @@ public class XInputTickHandler implements ITickHandler {
             return;
         }
 
-        // ── Hotbar: use action system so user remaps work in GUI too ──────────
+        //  Hotbar: use action system so user remaps work in GUI too 
         if (cur[ControllerAction.HOTBAR_PREV.ordinal()]
                 && !prevActionPressed[ControllerAction.HOTBAR_PREV.ordinal()]
                 && mc.thePlayer != null)
@@ -505,7 +537,7 @@ public class XInputTickHandler implements ITickHandler {
                 && mc.thePlayer != null)
             mc.thePlayer.inventory.currentItem = (mc.thePlayer.inventory.currentItem + 1) % 9;
 
-        // ── A: left-click / drag ──────────────────────────────────────────────
+        //  A: left-click / drag 
         if (cs.a && !prevA) {
             aHeldSince = System.currentTimeMillis(); isDragging = false;
             simulateMouseClick(screen, mouseX, mouseY, 0);
@@ -519,24 +551,24 @@ public class XInputTickHandler implements ITickHandler {
             isDragging = false;
         }
 
-        // ── B: right-click ────────────────────────────────────────────────────
+        //  B: right-click 
         if (cs.b && !prevB)
             simulateMouseClick(screen, mouseX, mouseY, 1);
 
-        // ── Y: shift-click ────────────────────────────────────────────────────
+        //  Y: shift-click 
         if (cs.y && !prevY && screen instanceof GuiContainer)
             shiftClickSlotAt((GuiContainer) screen, mouseX, mouseY);
 
-        // ── X: close screen ───────────────────────────────────────────────────
+        //  X: close screen 
         if (cs.x && !prevX && mc.thePlayer != null)
             closeGuiProperly(screen);
 
-        // ── Start: pause/resume or close GUI ─────────────────────────────────
+        //  Start: pause/resume or close GUI 
         if (cur[ControllerAction.PAUSE.ordinal()]
                 && !prevActionPressed[ControllerAction.PAUSE.ordinal()])
             handleStartInGui(screen);
 
-        // ── LB: scroll up, RB: scroll down ───────────────────────────────────
+        //  LB: scroll up, RB: scroll down 
         if (cs.lb && !prevLB) simulateMouseScroll(screen, mouseX, mouseY,  1);
         if (cs.rb && !prevRB) simulateMouseScroll(screen, mouseX, mouseY, -1);
     }
@@ -574,7 +606,7 @@ public class XInputTickHandler implements ITickHandler {
         if (guiMethodsResolved) return;
         guiMethodsResolved = true;
         try {
-            // mouseClicked / mouseReleased — (int x, int y, int button)
+            // mouseClicked / mouseReleased  (int x, int y, int button)
             for (Method m : GuiScreen.class.getDeclaredMethods()) {
                 Class<?>[] p = m.getParameterTypes();
                 if (p.length == 3
@@ -584,7 +616,7 @@ public class XInputTickHandler implements ITickHandler {
                     cachedTripleIntMethods.add(m);
                 }
             }
-            // mouseClickMove — (int x, int y, int button, long timeSinceLastClick)
+            // mouseClickMove  (int x, int y, int button, long timeSinceLastClick)
             for (Method m : GuiScreen.class.getDeclaredMethods()) {
                 Class<?>[] p = m.getParameterTypes();
                 if (p.length == 4
@@ -594,7 +626,7 @@ public class XInputTickHandler implements ITickHandler {
                     m.setAccessible(true); cachedMouseDrag = m; break;
                 }
             }
-            // actionPerformed(GuiButton) — walk hierarchy
+            // actionPerformed(GuiButton)  walk hierarchy
             outer:
             for (Class<?> c = GuiScreen.class; c != null; c = c.getSuperclass()) {
                 for (Method m : c.getDeclaredMethods()) {
@@ -606,7 +638,7 @@ public class XInputTickHandler implements ITickHandler {
                     }
                 }
             }
-            // buttonList field — walk hierarchy
+            // buttonList field  walk hierarchy
             outer2:
             for (Class<?> c = GuiScreen.class; c != null; c = c.getSuperclass()) {
                 for (Field f : c.getDeclaredFields()) {
@@ -676,12 +708,12 @@ public class XInputTickHandler implements ITickHandler {
 
     /**
      * Simulate a mouse scroll wheel event.
-     * In 1.4.7 GuiScreen doesn't have a scroll method — we use handleMouseInput()
+     * In 1.4.7 GuiScreen doesn't have a scroll method  we use handleMouseInput()
      * which reads Mouse.getEventDWheel().  Since we can't fake that, we fall back
      * to scrolling the container's scroll bar if one exists, or shift-clicking.
      */
     private void simulateMouseScroll(GuiScreen screen, int mx, int my, int dir) {
-        // Try handleMouseInput() via reflection (reads LWJGL event queue — may not work)
+        // Try handleMouseInput() via reflection (reads LWJGL event queue  may not work)
         try {
             Method hmr = null;
             for (Method m : screen.getClass().getMethods()) {
@@ -759,12 +791,72 @@ public class XInputTickHandler implements ITickHandler {
     }
 
     private void releaseMovementKeys() {
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode,    false);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindLeft.keyCode,    false);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.keyCode,   false);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode,    false);
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSneak.keyCode,   false);
+        setKey(mc.gameSettings.keyBindForward, false);
+        setKey(mc.gameSettings.keyBindBack,    false);
+        setKey(mc.gameSettings.keyBindLeft,    false);
+        setKey(mc.gameSettings.keyBindRight,   false);
+        setKey(mc.gameSettings.keyBindJump,    false);
+        setKey(mc.gameSettings.keyBindSneak,   false);
+    }
+
+    /**
+     * Sets a KeyBinding's pressed state AND maintains the press counter.
+     *
+     * In 1.4.7, Minecraft's movement code checks KeyBinding.isPressed() which
+     * internally decrements a pressTime counter. If we only call setKeyBindState()
+     * the counter stays at 0 and isPressed() returns false, so the player only
+     * moves one step per press (the "tapping" bug).
+     *
+     * Fix: when the key should be held, we set the state true AND increment
+     * pressTime by 1 each tick so isPressed() always returns true while held.
+     * When releasing, we zero both.
+     */
+    private static Field kbPressTime = null;
+    private static boolean kbPressTimeSearched = false;
+
+    private void setKey(KeyBinding kb, boolean pressed) {
+        try {
+            KeyBinding.setKeyBindState(kb.keyCode, pressed);
+
+            // Find the pressTime field once (it's an int named "pressTime" in MCP,
+            // but may be obfuscated  scan for the second int field after keyCode)
+            if (!kbPressTimeSearched) {
+                kbPressTimeSearched = true;
+                // Try MCP name first
+                try {
+                    kbPressTime = KeyBinding.class.getDeclaredField("pressTime");
+                    kbPressTime.setAccessible(true);
+                } catch (NoSuchFieldException ignored) {}
+
+                // Obfuscated fallback: find int fields, pressTime is typically
+                // the one after keyCode. keyCode is the first int field.
+                if (kbPressTime == null) {
+                    java.util.List<Field> ints = new java.util.ArrayList<Field>();
+                    for (Field f : KeyBinding.class.getDeclaredFields())
+                        if (f.getType() == int.class) { f.setAccessible(true); ints.add(f); }
+                    // ints[0]=keyCode, ints[1]=pressTime (in vanilla 1.4.7)
+                    if (ints.size() >= 2) kbPressTime = ints.get(1);
+                }
+
+                if (kbPressTime != null)
+                    log("KeyBinding pressTime field: " + kbPressTime.getName());
+                else
+                    log("WARNING: could not find KeyBinding.pressTime  movement may be broken");
+            }
+
+            if (kbPressTime != null) {
+                if (pressed) {
+                    // Increment counter each tick so isPressed() keeps returning true
+                    int cur = kbPressTime.getInt(kb);
+                    kbPressTime.setInt(kb, cur + 1);
+                } else {
+                    kbPressTime.setInt(kb, 0);
+                }
+            }
+        } catch (Throwable t) {
+            // Hard fallback: at least set the state
+            try { KeyBinding.setKeyBindState(kb.keyCode, pressed); } catch (Throwable ignored) {}
+        }
     }
 
     private static float processAxis(float v, float dz) {
