@@ -389,17 +389,25 @@ public class XInputTickHandler implements ITickHandler {
         }
         stickWasDrivingMovement = stickActive;
 
-        // Held actions: only set when controller triggers them; never clear keyboard binds.
-        // Jump/Sneak/Attack/UseItem are safe to always write because they are
-        // not typically held via keyboard at the same time as a controller.
-        setKey(mc.gameSettings.keyBindUseItem, cur[ControllerAction.USE_ITEM.ordinal()]);
-        setKey(mc.gameSettings.keyBindAttack,  cur[ControllerAction.ATTACK.ordinal()]);
-        setKey(mc.gameSettings.keyBindJump,    cur[ControllerAction.JUMP.ordinal()]);
-        setKey(mc.gameSettings.keyBindSneak,   cur[ControllerAction.SNEAK.ordinal()]);
+        // Jump and Sneak are safe to drive via pressTime  they are genuine held
+        // keybindings that Minecraft checks with isKeyDown(), not pressTime.
+        setKey(mc.gameSettings.keyBindJump,  cur[ControllerAction.JUMP.ordinal()]);
+        setKey(mc.gameSettings.keyBindSneak, cur[ControllerAction.SNEAK.ordinal()]);
 
-        // Edge-triggered actions
-        if (cur[ControllerAction.ATTACK.ordinal()]
-                && !prevActionPressed[ControllerAction.ATTACK.ordinal()]
+        // Attack (left-click / RT): Minecraft checks mouse button 0 for mining,
+        // but also checks keyBindAttack for the key equivalent.  Drive it via
+        // setKeyBindState only (no pressTime increment) so it behaves like a
+        // held mouse button  Minecraft's own tick rate controls the fire rate.
+        boolean attacking = cur[ControllerAction.ATTACK.ordinal()];
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindAttack.keyCode, attacking);
+
+        // Use Item (right-click / LT): same approach  held state only, no pressTime.
+        // Minecraft's own right-click repeat logic (item use timer) controls rate.
+        boolean usingItem = cur[ControllerAction.USE_ITEM.ordinal()];
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, usingItem);
+
+        // Swing arm and hit entity on the leading edge of attack only
+        if (attacking && !prevActionPressed[ControllerAction.ATTACK.ordinal()]
                 && mc.thePlayer != null) {
             mc.thePlayer.swingItem();
             if (mc.objectMouseOver != null && mc.objectMouseOver.entityHit != null)
@@ -797,6 +805,9 @@ public class XInputTickHandler implements ITickHandler {
         setKey(mc.gameSettings.keyBindRight,   false);
         setKey(mc.gameSettings.keyBindJump,    false);
         setKey(mc.gameSettings.keyBindSneak,   false);
+        // Attack and UseItem use plain setKeyBindState (no pressTime), release the same way
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindAttack.keyCode,  false);
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, false);
     }
 
     /**
